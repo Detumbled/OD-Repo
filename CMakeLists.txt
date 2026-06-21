@@ -124,6 +124,7 @@ endif()
 set(BIG_FUNCTIONS_SOURCES
     src/dummy.cpp
     src/hi.cpp
+    src/StationCatalog.cpp
 )
 
 add_library(big_functions STATIC ${BIG_FUNCTIONS_SOURCES})
@@ -136,6 +137,7 @@ set(APP_SOURCES
     Try3D.cpp
     example_4_2_1.cpp
     main.cpp
+    station_catalog_demo.cpp
     test_stations.cpp
 )
 
