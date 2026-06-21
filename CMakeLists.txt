@@ -136,6 +136,7 @@ set(APP_SOURCES
     Try3D.cpp
     example_4_2_1.cpp
     main.cpp
+    test_stations.cpp
 )
 
 foreach(app_src IN LISTS APP_SOURCES)
