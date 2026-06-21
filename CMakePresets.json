@@ -1,0 +1,22 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "homebrew-clang",
+      "displayName": "Homebrew Clang",
+      "description": "Builds using the latest Clang from Homebrew",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-clang",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "/opt/homebrew/opt/llvm/bin/clang",
+        "CMAKE_CXX_COMPILER": "/opt/homebrew/opt/llvm/bin/clang++",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_PREFIX_PATH": "/opt/homebrew/opt/eigen;/opt/homebrew",
+        "CMAKE_AR": "/usr/bin/ar",
+        "CMAKE_RANLIB": "/usr/bin/ranlib",
+        "CMAKE_CXX_COMPILER_AR": "/usr/bin/ar",
+        "CMAKE_CXX_COMPILER_RANLIB": "/usr/bin/ranlib"
+      }
+    }
+  ]
+}

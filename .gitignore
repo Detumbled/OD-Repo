@@ -1,0 +1,12 @@
+build-clang/
+.DS_Store
+.vscode/
+Kernels/
+kernels.tm
+test_mrp_class.cpp
+examples/
+third_party/
+
+
+*.o
+*.a

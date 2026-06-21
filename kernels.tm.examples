@@ -1,0 +1,4 @@
+\begindata
+    PATH_VALUES     = ( './Kernels' )
+    KERNELS_TO_LOAD = ( '$KERNELS/naif0012.tls', ... )
+\begintext
