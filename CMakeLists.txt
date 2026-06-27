@@ -121,11 +121,19 @@ endif()
 # ------------------------------
 # 6. Static Library (Astro functions)
 # ------------------------------
-set(BIG_FUNCTIONS_SOURCES
-    src/dummy.cpp
-    src/hi.cpp
+set(BIG_FUNCTIONS_SOURCE_CANDIDATES
     src/StationCatalog.cpp
+    src/RKF45Integrator.cpp
+    src/filters/filter.cpp
+    src/filters/WLS.cpp
 )
+
+set(BIG_FUNCTIONS_SOURCES)
+foreach(candidate_src IN LISTS BIG_FUNCTIONS_SOURCE_CANDIDATES)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${candidate_src}")
+        list(APPEND BIG_FUNCTIONS_SOURCES "${candidate_src}")
+    endif()
+endforeach()
 
 add_library(big_functions STATIC ${BIG_FUNCTIONS_SOURCES})
 target_link_libraries(big_functions PUBLIC project_dependencies)
@@ -133,13 +141,21 @@ target_link_libraries(big_functions PUBLIC project_dependencies)
 # ------------------------------
 # 7. Executables
 # ------------------------------
-set(APP_SOURCES
+set(APP_SOURCE_CANDIDATES
     Try3D.cpp
-    example_4_2_1.cpp
     main.cpp
     station_catalog_demo.cpp
     test_stations.cpp
+    test_rkf45.cpp
+    tests/test_wls.cpp
 )
+
+set(APP_SOURCES)
+foreach(candidate_src IN LISTS APP_SOURCE_CANDIDATES)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${candidate_src}")
+        list(APPEND APP_SOURCES "${candidate_src}")
+    endif()
+endforeach()
 
 foreach(app_src IN LISTS APP_SOURCES)
     get_filename_component(app_name "${app_src}" NAME_WE)
