@@ -155,6 +155,7 @@ set(APP_SOURCE_CANDIDATES
     tests/test_wls.cpp
     tests/test_synth_observations.cpp
     tests/test_perturbations.cpp
+    tests/test_voyager_position_od.cpp
 )
 
 set(APP_SOURCES)
@@ -169,8 +170,13 @@ foreach(app_src IN LISTS APP_SOURCES)
     add_executable(${app_name} "${app_src}")
     target_link_libraries(${app_name} PRIVATE big_functions)
 
-    if(app_name STREQUAL "test_synth_observations" OR app_name STREQUAL "test_perturbations")
+    if(app_name STREQUAL "test_synth_observations"
+       OR app_name STREQUAL "test_perturbations"
+       OR app_name STREQUAL "test_voyager_position_od")
         add_test(NAME ${app_name} COMMAND ${app_name} WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+        if(app_name STREQUAL "test_voyager_position_od")
+            set_tests_properties(${app_name} PROPERTIES DEPENDS test_synth_observations)
+        endif()
     elseif(app_name MATCHES "^test_")
         add_test(NAME ${app_name} COMMAND ${app_name} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     endif()

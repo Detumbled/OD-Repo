@@ -15,7 +15,8 @@ Implemented modules:
 - Synthetic one-way range and range-rate observations.
 - Solar Shapiro delay applied to synthetic radiometric observables.
 - Modular perturbation models for third-body gravity and cannonball SRP.
-- Focused tests for RKF45, WLS, synthetic observations, perturbations, and station-kernel sanity checks.
+- Focused tests for RKF45, WLS, synthetic observations, perturbations,
+  station-kernel sanity checks, and a Voyager 1 position OD smoke case.
 
 Planned or partial areas:
 
@@ -61,6 +62,7 @@ tests/
   test_wls.cpp
   test_synth_observations.cpp
   test_perturbations.cpp
+  test_voyager_position_od.cpp
 
 test_rkf45.cpp
 test_stations.cpp
@@ -85,7 +87,8 @@ export CSPICE_HOME=/path/to/cspice
 ```
 
 The project expects the Voyager/DSN kernels under `Kernels/` and the meta-kernel
-at `kernels.tm`.
+at `kernels.tm`. The Voyager Jupiter-encounter OD test requires `jup310.bsp`
+for 1979 coverage of Jupiter body `599` and Galilean moons `501-504`.
 
 Important path convention: `kernels.tm` uses `PATH_VALUES = ( '../Kernels' )`.
 For tests or demos that load `../kernels.tm`, run from `build-clang`.
@@ -97,6 +100,7 @@ cmake --build build-clang --target test_rkf45 -j4
 cmake --build build-clang --target test_wls -j4
 cmake --build build-clang --target test_synth_observations -j4
 cmake --build build-clang --target test_perturbations -j4
+cmake --build build-clang --target test_voyager_position_od -j4
 cmake --build build-clang --target station_catalog_demo -j4
 ```
 
@@ -112,6 +116,7 @@ ctest --test-dir build-clang -R test_rkf45 --output-on-failure
 ctest --test-dir build-clang -R test_wls --output-on-failure
 ctest --test-dir build-clang -R test_synth_observations --output-on-failure
 ctest --test-dir build-clang -R test_perturbations --output-on-failure
+ctest --test-dir build-clang -R test_voyager_position_od --output-on-failure
 ```
 
 SPICE-backed tests are registered with `build-clang` as their working directory
@@ -189,17 +194,19 @@ Shared features:
 - Adds a finite-difference derivative of solar Shapiro delay using `dt = 1 s`.
 - Adds optional Gaussian range-rate noise.
 
-`test_synth_observations` generates:
+`test_synth_observations` generates interleaved station observations:
 
-- Station: DSS-43
+- Stations: DSS-43, DSS-63
 - Target: Voyager 1 (`-31`)
 - Start: `1979-03-05T00:00:00`
-- Duration: 1 hour
-- Cadence: 5 minutes
+- Duration: 3 hours
+- Cadence: 3 minutes
+- Samples: 122 total, 61 per station
 - Range sigma: 0.010 km
 - Range-rate sigma: `1.0e-6 km/s`
 
-The output report is:
+The output report keeps the historical filename but now includes a `station`
+column:
 
 ```text
 synthetic_observations_dss43_voyager1.txt
@@ -263,3 +270,25 @@ synthetic_observations_dss43_voyager1.txt
 
 This file is useful for inspecting synthetic observation values and for checking
 whether Shapiro/noise settings changed output.
+
+`test_voyager_position_od` consumes that report and estimates the Voyager 1
+initial state using RKF45 with Sun gravity, Jupiter body `599`, Galilean moons
+`501-504`, Saturn barycenter `6`, SRP, light-time, and Shapiro delay. It writes:
+
+```text
+tests/voyager_position_estimation_report.txt
+```
+
+Latest verified `jup310.bsp` run:
+
+```text
+Active third bodies: 599 501 502 503 504 6
+Prior position error:      70.710678 km
+Posterior position error:  51.587303 km
+Range RMS:                 37308.328 m -> 161.648 m
+Range-rate RMS:            457.768 mm/s -> 13.464 mm/s
+```
+
+This is a short-arc diagnostic test, not a final high-precision OD solution.
+Use the report residuals and future conditioning diagnostics before interpreting
+state accuracy from residual reduction alone.
