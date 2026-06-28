@@ -7,5 +7,7 @@ test_mrp_class.cpp
 examples/
 third_party/
 
+
+*.txt
 *.o
 *.a
