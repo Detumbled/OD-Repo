@@ -18,8 +18,9 @@ std::vector<SyntheticObservationSample> RangeSynth::generate(double startTdb,
     samples.reserve(epochs.size());
 
     for (const double epoch : epochs) {
-        const Eigen::Matrix<double, 6, 1> relative_state = relativeTargetState(epoch);
-        const double truth = relative_state.segment<3>(0).norm();
+        const RelativeGeometry geometry = relativeTargetGeometry(epoch);
+        const double geometric_range = geometry.stationToTargetState.segment<3>(0).norm();
+        const double truth = geometric_range + shapiroRangeDelay(geometry);
         const double noise = drawNoise();
 
         samples.push_back(SyntheticObservationSample{

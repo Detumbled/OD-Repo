@@ -19,7 +19,7 @@ struct GeometryConfig {
     std::string target {"-31"};
     std::string stationName {"DSS-43"};
     std::string frame {"J2000"};
-    std::string aberrationCorrection {"NONE"};
+    std::string aberrationCorrection {"LT"};
 };
 
 struct SyntheticObservationSample {
@@ -28,6 +28,13 @@ struct SyntheticObservationSample {
     double noise {0.0};
     double observed {0.0};
     double sigma {0.0};
+};
+
+struct RelativeGeometry {
+    Eigen::Matrix<double, 6, 1> stationToTargetState {Eigen::Matrix<double, 6, 1>::Zero()};
+    double lightTimeSec {0.0};
+    double receiveEpochTdb {0.0};
+    double emitEpochTdb {0.0};
 };
 
 class SyntheticObservation {
@@ -52,6 +59,11 @@ public:
 
 protected:
     [[nodiscard]] Eigen::Matrix<double, 6, 1> relativeTargetState(double epochTdb) const;
+    [[nodiscard]] RelativeGeometry relativeTargetGeometry(double receiveEpochTdb) const;
+    [[nodiscard]] Eigen::Matrix<double, 6, 1> sunRelativeState(const std::string& body,
+                                                              double epochTdb) const;
+    [[nodiscard]] double shapiroRangeDelay(double receiveEpochTdb) const;
+    [[nodiscard]] double shapiroRangeDelay(const RelativeGeometry& geometry) const;
     [[nodiscard]] double drawNoise();
 
     GeometryConfig geometry_;

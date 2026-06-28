@@ -1,6 +1,7 @@
 #include "observations/synth/obs_synth.hpp"
 
 #include "StationCatalog.hpp"
+#include "perturbations/Shapiro.hpp"
 
 #include <SpiceUsr.h>
 
@@ -149,7 +150,11 @@ std::vector<double> SyntheticObservation::makeEpochGrid(double startTdb,
 }
 
 Eigen::Matrix<double, 6, 1> SyntheticObservation::relativeTargetState(double epochTdb) const {
-    if (!std::isfinite(epochTdb)) {
+    return relativeTargetGeometry(epochTdb).stationToTargetState;
+}
+
+RelativeGeometry SyntheticObservation::relativeTargetGeometry(double receiveEpochTdb) const {
+    if (!std::isfinite(receiveEpochTdb)) {
         throw std::invalid_argument("Synthetic observation epoch must be finite.");
     }
 
@@ -160,7 +165,7 @@ Eigen::Matrix<double, 6, 1> SyntheticObservation::relativeTargetState(double epo
     SpiceDouble light_time = 0.0;
 
     spkezr_c(geometry_.target.c_str(),
-             epochTdb,
+             receiveEpochTdb,
              geometry_.frame.c_str(),
              geometry_.aberrationCorrection.c_str(),
              observer.c_str(),
@@ -169,12 +174,72 @@ Eigen::Matrix<double, 6, 1> SyntheticObservation::relativeTargetState(double epo
 
     throwIfSpiceFailed("Failed to compute synthetic observation geometry for station " + geometry_.stationName);
 
+    RelativeGeometry geometry;
+    geometry.lightTimeSec = light_time;
+    geometry.receiveEpochTdb = receiveEpochTdb;
+    geometry.emitEpochTdb = receiveEpochTdb - light_time;
+
+    for (Eigen::Index i = 0; i < geometry.stationToTargetState.size(); ++i) {
+        geometry.stationToTargetState[i] = spice_state[i];
+    }
+
+    return geometry;
+}
+
+Eigen::Matrix<double, 6, 1> SyntheticObservation::sunRelativeState(const std::string& body,
+                                                                   double epochTdb) const {
+    if (body.empty()) {
+        throw std::invalid_argument("Synthetic observation Sun-relative body cannot be empty.");
+    }
+    if (!std::isfinite(epochTdb)) {
+        throw std::invalid_argument("Synthetic observation Sun-relative epoch must be finite.");
+    }
+
+    SpiceErrorActionGuard action_guard;
+
+    SpiceDouble spice_state[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    SpiceDouble light_time = 0.0;
+
+    spkezr_c(body.c_str(),
+             epochTdb,
+             geometry_.frame.c_str(),
+             "NONE",
+             "SUN",
+             spice_state,
+             &light_time);
+
+    throwIfSpiceFailed("Failed to compute Sun-relative synthetic observation state for " + body);
+
     Eigen::Matrix<double, 6, 1> state;
     for (Eigen::Index i = 0; i < state.size(); ++i) {
         state[i] = spice_state[i];
     }
 
     return state;
+}
+
+double SyntheticObservation::shapiroRangeDelay(double receiveEpochTdb) const {
+    return shapiroRangeDelay(relativeTargetGeometry(receiveEpochTdb));
+}
+
+double SyntheticObservation::shapiroRangeDelay(const RelativeGeometry& geometry) const {
+    const std::string observer = stationTargetName(geometry_.stationName);
+    const Eigen::Matrix<double, 6, 1> observer_sun_state = sunRelativeState(observer,
+                                                                            geometry.receiveEpochTdb);
+    const Eigen::Matrix<double, 6, 1> target_sun_state = sunRelativeState(geometry_.target,
+                                                                          geometry.emitEpochTdb);
+
+    const Eigen::Vector3d observer_from_sun = observer_sun_state.segment<3>(0);
+    const Eigen::Vector3d target_from_sun = target_sun_state.segment<3>(0);
+    const double r_obs_mag = observer_from_sun.norm();
+    const double r_target_mag = target_from_sun.norm();
+    const double rho_mag = (target_from_sun - observer_from_sun).norm();
+
+    return fd::perturbations::computeShapiroRangeDelay(
+        r_obs_mag,
+        r_target_mag,
+        rho_mag,
+        fd::perturbations::kSunGravitationalParameterKm3PerSec2);
 }
 
 double SyntheticObservation::drawNoise() {

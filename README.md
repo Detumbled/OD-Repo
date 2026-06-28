@@ -1,507 +1,265 @@
-# Deep Space Navigation and Attitude Simulation Framework
+# OD-Repo
 
-## Overview
+Orbit-determination and flight-dynamics sandbox for DSN/Voyager tracking work.
+The current implementation is centered on C++/Eigen numerical utilities,
+CSPICE-backed station geometry, synthetic observations, perturbation models, and
+batch weighted least-squares filtering.
 
-This project aims to develop a high-fidelity simulation framework that combines:
+## Current Scope
 
-* Orbit propagation
-* Orbit determination
-* Attitude dynamics
-* Attitude determination and control (AOCS)
-* Deep-space antenna pointing
-* Synthetic measurement generation
-* Navigation performance analysis
+Implemented modules:
 
-The primary mission scenario consists of a spacecraft equipped with a steerable high-gain antenna tracking Voyager 1 while simultaneously transmitting navigation information to Earth.
+- CSPICE-backed DSN station catalog.
+- Adaptive RKF45 integrator using Eigen vectors and preallocated stage storage.
+- Batch Weighted Least Squares filter with a priori information.
+- Synthetic one-way range and range-rate observations.
+- Solar Shapiro delay applied to synthetic radiometric observables.
+- Modular perturbation models for third-body gravity and cannonball SRP.
+- Focused tests for RKF45, WLS, synthetic observations, perturbations, and station-kernel sanity checks.
 
-The simulation environment is built around NASA SPICE kernels and provides a complete chain from truth-state generation to navigation-state estimation.
+Planned or partial areas:
 
----
+- Computed-observation light-time iteration integrated with the estimator.
+- Full dynamics builder that sums central gravity, third bodies, SRP, and future force models.
+- Sequential filters and richer OD diagnostics.
+- Attitude/AOCS and visualization work.
 
-# Mission Scenario
-
-## Concept
-
-A deep-space spacecraft acts as a relay and observation platform.
-
-The spacecraft:
-
-1. Tracks Voyager 1.
-2. Maintains antenna lock on Voyager.
-3. Generates synthetic observations.
-4. Downlinks measurements to Earth.
-5. Performs onboard orbit determination.
-
-The framework compares:
-
-* Spaceborne measurements
-* Ground-based measurements
-* Estimated states
-* Truth states from SPICE
-
----
-
-# Main Objectives
-
-## Orbit Determination
-
-Implement and compare:
-
-### Initial Orbit Determination
-
-* Gauss Method
-* Gibbs Method
-* Herrick-Gibbs Method
-* Lambert-based estimation
-
-### Statistical Orbit Determination
-
-* Weighted Least Squares
-* Batch Least Squares
-* Sequential Least Squares
-* Extended Kalman Filter
-* Unscented Kalman Filter
-
-Based primarily on:
-
-* Tapley, Statistical Orbit Determination
-
----
-
-## Attitude Determination and Control
-
-Implement:
-
-### Reference Frames
-
-* ECI
-* ECEF
-* LVLH
-* Hill Frame
-* Spacecraft Body Frame
-
-### Attitude Representations
-
-* Direction Cosine Matrices
-* Euler Angles
-* Modified Rodrigues Parameters
-* Quaternions
-
-### Attitude Dynamics
-
-Rigid-body equations:
-
-Iω̇ + ω × (Iω) = τ
-
-### Attitude Controllers
-
-* PD Controller
-* Quaternion Feedback Control
-* Reaction Wheel Control
-
-Based primarily on:
-
-* Schaub & Junkins
-
----
-
-# Software Architecture
-
-## Module Structure
+## Repository Layout
 
 ```text
 include/
-
-    Orbit/
-        Propagator.hpp
-        ForceModels.hpp
-        Lambert.hpp
-        Gibbs.hpp
-        BatchLS.hpp
-        EKF.hpp
-
-    Attitude/
-        Quaternion.hpp
-        DCM.hpp
-        AttitudeDynamics.hpp
-        Controllers.hpp
-
-    Sensors/
-        StarTracker.hpp
-        Gyroscope.hpp
-        Antenna.hpp
-
-    Measurements/
-        Range.hpp
-        Doppler.hpp
-        AngleMeasurement.hpp
-
-    Spice/
-        SpiceManager.hpp
-        FrameTransform.hpp
-
-    Visualization/
-        Camera.hpp
-        SpacecraftRenderer.hpp
+  RKF45Integrator.hpp
+  StationCatalog.hpp
+  Stations.hpp
+  filters/
+    filter.hpp
+    WLS.hpp
+  observations/synth/
+    obs_synth.hpp
+    RangeSynth.hpp
+    RangeRateSynth.hpp
+  perturbations/
+    Gravitational.hpp
+    SRP.hpp
+    Shapiro.hpp
 
 src/
+  RKF45Integrator.cpp
+  StationCatalog.cpp
+  filters/
+    filter.cpp
+    WLS.cpp
+  observations/synth/
+    obs_synth.cpp
+    RangeSynth.cpp
+    RangeRateSynth.cpp
+  perturbations/
+    Gravitational.cpp
+    SRP.cpp
 
-    orbit/
-    attitude/
-    sensors/
-    measurements/
-    spice/
-    visualization/
+tests/
+  test_wls.cpp
+  test_synth_observations.cpp
+  test_perturbations.cpp
+
+test_rkf45.cpp
+test_stations.cpp
+station_catalog_demo.cpp
+kernels.tm
 ```
 
----
+## Dependencies
 
-# Phase 1 — Truth Model
+The CMake project currently uses C++23 and links these dependencies:
 
-## SPICE Integration
+- Eigen3
+- CSPICE
+- Ceres
+- GLFW, GLEW, OpenGL
+- local `third_party/imgui`, `third_party/implot`, and `third_party/glm`
 
-Load:
+`CSPICE_HOME` must point to the CSPICE installation:
 
-* Planetary ephemerides
-* Voyager kernels
-* Earth orientation kernels
-* Leap second kernels
+```sh
+export CSPICE_HOME=/path/to/cspice
+```
 
-Primary CSPICE functions:
+The project expects the Voyager/DSN kernels under `Kernels/` and the meta-kernel
+at `kernels.tm`.
 
-* furnsh_c()
-* spkezr_c()
-* sxform_c()
-* pxform_c()
-* str2et_c()
+Important path convention: `kernels.tm` uses `PATH_VALUES = ( '../Kernels' )`.
+For tests or demos that load `../kernels.tm`, run from `build-clang`.
 
-Outputs:
+## Build
 
-* Spacecraft state
-* Voyager state
-* Earth state
-* Frame transformations
+```sh
+cmake --build build-clang --target test_rkf45 -j4
+cmake --build build-clang --target test_wls -j4
+cmake --build build-clang --target test_synth_observations -j4
+cmake --build build-clang --target test_perturbations -j4
+cmake --build build-clang --target station_catalog_demo -j4
+```
 
----
+The current `CMakeLists.txt` filters source candidates with `EXISTS` so missing
+legacy examples do not break generation.
 
-# Phase 2 — Orbit Propagation
+## Tests
 
-## Two-Body Dynamics
+Run focused tests:
 
-State vector:
+```sh
+ctest --test-dir build-clang -R test_rkf45 --output-on-failure
+ctest --test-dir build-clang -R test_wls --output-on-failure
+ctest --test-dir build-clang -R test_synth_observations --output-on-failure
+ctest --test-dir build-clang -R test_perturbations --output-on-failure
+```
 
-x = [r,v]
+SPICE-backed tests are registered with `build-clang` as their working directory
+so `../kernels.tm` resolves correctly.
 
-Equation:
+`test_stations.cpp` is an older kernel smoke test and currently hard-codes
+`../Kernels.tm`. On case-sensitive filesystems, either update that literal to
+`../kernels.tm` or provide a matching compatibility file before relying on it in
+an all-test run.
 
-r¨ = -μr/r³
+## Implemented Components
 
----
+### Station Catalog
 
-## Perturbation Models
+`StationCatalog.hpp/.cpp` provides:
 
-### Earth Missions
+- `defaultDsnStationCatalog()`
+- `stationNaifIdFromName(...)`
+- `buildStationFromKernel(...)`
+- `buildDefaultDsnCatalogFromKernel(...)`
 
-* J2
-* J3
-* Atmospheric Drag
-* Solar Radiation Pressure
+Kernel loading remains the caller's responsibility. The catalog code queries
+CSPICE and returns `od::Station` objects without mutating the base station model.
 
-### Deep-Space Missions
+### RKF45 Integrator
 
-* Third-body perturbations
-* Solar Radiation Pressure
-* Relativistic corrections (optional)
+`RKF45Integrator` uses:
 
----
+- `Eigen::VectorXd` state representation.
+- `Eigen::Ref` derivative callbacks.
+- Fehlberg 4(5) embedded error estimate.
+- Adaptive step acceptance/rejection.
+- Preallocated trial, fourth-order, fifth-order, and stage matrices.
 
-## Numerical Integrators
+`test_rkf45` propagates a simple circular Kepler orbit for one period and checks
+position closure, velocity closure, energy, angular momentum, and runtime.
 
-Implement:
+### WLS Filter
 
-### Fixed Step
+`fd::filters::WLS` implements a batch Weighted Least Squares update with a priori
+information:
 
-* RK4
+```text
+Lambda = H^T R^-1 H + P0^-1
+N      = H^T R^-1 r + P0^-1 (x_prior - x_nominal)
+dx     = Lambda^-1 N
+```
 
-### Adaptive
+The implementation uses Eigen solves rather than explicitly forming `R^-1`.
+LDLT is attempted first, with QR fallback for robustness.
 
-* RKF45
-* Dormand-Prince 8(7)
+`test_wls` creates an 8-hour synthetic range arc with 10 m noise and verifies
+that the filter reduces both linearized and nonlinear range residual RMS.
 
----
+### Synthetic Observations
 
-# Phase 3 — Attitude Simulation
+Synthetic observation classes live under `fd::observations::synth`.
 
-## Spacecraft Model
+Shared features:
 
-State:
+- `GeometryConfig`: target, station, frame, aberration correction.
+- `NoiseConfig`: enabled flag, sigma, random seed.
+- Configurable time grid via `makeEpochGrid(start, end, step)`.
+- CSPICE station names resolved through the DSN station catalog.
 
-x_att = [q,ω]
+`RangeSynth`:
 
-where:
+- Gets light-time corrected station-to-target geometry through CSPICE.
+- Adds solar Shapiro range delay.
+- Adds optional Gaussian range noise.
 
-q = quaternion
+`RangeRateSynth`:
 
-ω = body angular velocity
+- Computes geometric one-way range-rate from relative position/velocity.
+- Adds a finite-difference derivative of solar Shapiro delay using `dt = 1 s`.
+- Adds optional Gaussian range-rate noise.
 
----
+`test_synth_observations` generates:
 
-## Actuators
+- Station: DSS-43
+- Target: Voyager 1 (`-31`)
+- Start: `1979-03-05T00:00:00`
+- Duration: 1 hour
+- Cadence: 5 minutes
+- Range sigma: 0.010 km
+- Range-rate sigma: `1.0e-6 km/s`
 
-### Reaction Wheels
+The output report is:
 
-Model:
+```text
+synthetic_observations_dss43_voyager1.txt
+```
 
-τ_rw
+### Perturbations
 
-### Thrusters
+`fd::perturbations::Shapiro` provides inline reusable functions:
 
-Optional future extension.
+- `computeShapiroRangeDelay(...)`
+- `computeShapiroTimeDelay(...)`
 
----
+`fd::perturbations::ThirdBodyGravity` computes:
 
-## Sensors
+```text
+a_3rd = mu_i * (r_sc_to_i / |r_sc_to_i|^3 - r_central_to_i / |r_central_to_i|^3)
+```
 
-### Star Tracker
+`fd::perturbations::SolarRadiationPressure` computes cannonball SRP:
 
-Output:
+- anti-sunward direction
+- configurable `C_R`, area, and mass
+- returns `km/s^2`
 
-q_measured
+`test_perturbations` evaluates both at `1979-03-05T00:00:00` for Voyager 1:
 
-Noise:
+```text
+Jupiter third-body acceleration norm = 1.463970346623e-04 km/s^2
+SRP acceleration norm                = 2.941469913405e-12 km/s^2
+```
 
-Gaussian attitude error
+## Units
 
----
+Unless otherwise noted:
 
-### Gyroscope
+- distance: km
+- time: s
+- velocity: km/s
+- acceleration: km/s^2
+- SRP pressure: N/m^2 internally, converted to km/s^2 at output
 
-Output:
+## SPICE Notes
 
-ω_measured
+- Reusable modules do not call `furnsh_c`.
+- Tests and demos load meta-kernels explicitly.
+- The canonical repository meta-kernel is lowercase `kernels.tm`; some legacy
+  files may still mention `Kernels.tm`.
+- SPICE error mode is temporarily set to `RETURN` inside reusable modules that
+  query CSPICE, then restored with RAII guards.
+- Pure dynamics perturbation geometry uses no aberration correction (`"NONE"`).
+- Synthetic observations currently default to light-time correction (`"LT"`) and
+  then add Shapiro delay explicitly.
 
-Include:
+## Generated Files
 
-* Bias
-* Scale factor
-* White noise
+`test_synth_observations` writes:
 
----
+```text
+synthetic_observations_dss43_voyager1.txt
+```
 
-# Phase 4 — Antenna Pointing
-
-## High Gain Antenna
-
-Define:
-
-* Beam width
-* Maximum slew rate
-* Boresight vector
-
----
-
-## Pointing Error
-
-Compute:
-
-θ = acos(b · LOS)
-
-where:
-
-LOS is the line-of-sight vector to Voyager.
-
----
-
-## Performance Metrics
-
-Track:
-
-* Pointing accuracy
-* Time inside beam
-* Maximum pointing error
-* RMS pointing error
-
----
-
-# Phase 5 — Measurement Generation
-
-## Angular Measurements
-
-Generate:
-
-* Right Ascension
-* Declination
-
-Measurement model:
-
-z = h(x) + v
-
----
-
-## Range Measurements
-
-ρ = ||r_target-r_observer||
-
-Noise model:
-
-σ_range
-
----
-
-## Doppler Measurements
-
-fD = -(vLOS/c)f0
-
-Noise model:
-
-σ_doppler
-
----
-
-## Antenna-Based Measurements
-
-Estimate:
-
-* Signal strength
-* Gain loss
-* Pointing offset
-
----
-
-# Phase 6 — Orbit Determination
-
-## Batch Least Squares
-
-Implement:
-
-minimize:
-
-J = rᵀWr
-
-where:
-
-r = residual vector
-
-W = weighting matrix
-
----
-
-## Covariance Analysis
-
-Compute:
-
-P = (HᵀWH)^(-1)
-
-Analyze:
-
-* Position uncertainty
-* Velocity uncertainty
-* Correlation structure
-
----
-
-## Extended Kalman Filter
-
-Propagation:
-
-x̂(k+1)
-
-Covariance:
-
-P(k+1)
-
-Measurement update:
-
-K = PHᵀ(HPHᵀ+R)^(-1)
-
----
-
-# Phase 7 — Earth Comparison
-
-Simulate observations from:
-
-* Goldstone
-* Madrid
-* Canberra
-
-Compare:
-
-* Ground-only OD
-* Spacecraft-only OD
-* Combined OD
-
-Metrics:
-
-* RMS position error
-* RMS velocity error
-* Covariance volume
-* Convergence time
-
----
-
-# Visualization
-
-## 3D Scene
-
-Display:
-
-* Sun
-* Earth
-* Voyager
-* Observer spacecraft
-
-Render:
-
-* Trajectories
-* Attitude axes
-* Antenna beam cone
-* Measurement rays
-
----
-
-## Analysis Plots
-
-Generate:
-
-* Position errors
-* Velocity errors
-* Attitude errors
-* Covariance evolution
-* Residual histories
-
----
-
-# Long-Term Extensions
-
-## Autonomous Navigation
-
-* Optical navigation
-* Beacon tracking
-* Relative navigation
-
-## Multi-Spacecraft Scenarios
-
-* Formation flying
-* Relay constellations
-* Interplanetary navigation networks
-
-## Advanced Filters
-
-* Unscented Kalman Filter
-* Square Root Information Filter
-* Particle Filter
-
----
-
-# Expected Outcomes
-
-The project should provide:
-
-1. A reusable astrodynamics library.
-2. A reusable AOCS library.
-3. A complete orbit determination framework.
-4. A deep-space navigation simulator.
-5. A SPICE-based mission analysis environment.
-6. Validation against real ephemerides and tracking geometries.
-7. A portfolio-grade aerospace software project approaching professional mission-analysis tools.
-   """
+This file is useful for inspecting synthetic observation values and for checking
+whether Shapiro/noise settings changed output.

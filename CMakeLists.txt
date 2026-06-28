@@ -129,6 +129,8 @@ set(BIG_FUNCTIONS_SOURCE_CANDIDATES
     src/observations/synth/obs_synth.cpp
     src/observations/synth/RangeSynth.cpp
     src/observations/synth/RangeRateSynth.cpp
+    src/perturbations/Gravitational.cpp
+    src/perturbations/SRP.cpp
 )
 
 set(BIG_FUNCTIONS_SOURCES)
@@ -152,6 +154,7 @@ set(APP_SOURCE_CANDIDATES
     test_rkf45.cpp
     tests/test_wls.cpp
     tests/test_synth_observations.cpp
+    tests/test_perturbations.cpp
 )
 
 set(APP_SOURCES)
@@ -166,7 +169,7 @@ foreach(app_src IN LISTS APP_SOURCES)
     add_executable(${app_name} "${app_src}")
     target_link_libraries(${app_name} PRIVATE big_functions)
 
-    if(app_name STREQUAL "test_synth_observations")
+    if(app_name STREQUAL "test_synth_observations" OR app_name STREQUAL "test_perturbations")
         add_test(NAME ${app_name} COMMAND ${app_name} WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
     elseif(app_name MATCHES "^test_")
         add_test(NAME ${app_name} COMMAND ${app_name} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

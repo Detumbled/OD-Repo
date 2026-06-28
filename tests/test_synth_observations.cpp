@@ -48,6 +48,7 @@ void throwIfSpiceFailed(const std::string& context) {
 void writeReport(
     const std::string& path,
     const od::Station& station,
+    const fd::observations::synth::GeometryConfig& geometry,
     const std::vector<fd::observations::synth::SyntheticObservationSample>& ranges,
     const std::vector<fd::observations::synth::SyntheticObservationSample>& range_rates) {
     if (ranges.size() != range_rates.size()) {
@@ -66,13 +67,14 @@ void writeReport(
            << "# station_lat_deg       : " << station.latitudeRad() * dpr_c() << '\n'
            << "# station_lon_deg_east  : " << station.longitudeRad() * dpr_c() << '\n'
            << "# station_alt_km        : " << station.altitudeKm() << '\n'
-           << "# frame                 : J2000\n"
-           << "# aberration_correction : NONE\n"
+           << "# frame                 : " << geometry.frame << '\n'
+           << "# aberration_correction : " << geometry.aberrationCorrection << '\n'
+           << "# relativistic_delay    : Solar Shapiro range delay applied\n"
            << "# range_sigma_km        : " << kRangeSigmaKm << '\n'
            << "# range_rate_sigma_km_s : " << kRangeRateSigmaKmPerSec << '\n'
            << "# cadence_seconds       : " << kCadenceSec << '\n'
-           << "# columns: utc epoch_tdb range_truth_km range_noise_km range_observed_km "
-              "range_sigma_km range_rate_truth_km_s range_rate_noise_km_s "
+           << "# columns: utc epoch_tdb range_truth_shapiro_km range_noise_km range_observed_km "
+              "range_sigma_km range_rate_truth_shapiro_km_s range_rate_noise_km_s "
               "range_rate_observed_km_s range_rate_sigma_km_s\n";
 
     for (std::size_t i = 0; i < ranges.size(); ++i) {
@@ -110,7 +112,7 @@ int main() {
         geometry.target = kTarget;
         geometry.stationName = kStationName;
         geometry.frame = "J2000";
-        geometry.aberrationCorrection = "NONE";
+        geometry.aberrationCorrection = "LT";
 
         fd::observations::synth::NoiseConfig range_noise;
         range_noise.enabled = true;
@@ -129,7 +131,7 @@ int main() {
         const auto ranges = range_synth.generate(start_et, end_et, kCadenceSec);
         const auto range_rates = range_rate_synth.generate(start_et, end_et, kCadenceSec);
 
-        writeReport(kReportPath, station, ranges, range_rates);
+        writeReport(kReportPath, station, geometry, ranges, range_rates);
 
         std::cout << "Generated " << ranges.size()
                   << " synthetic DSS-43 Voyager 1 observations in " << kReportPath << '\n'
