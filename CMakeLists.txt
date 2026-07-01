@@ -122,8 +122,10 @@ endif()
 # 6. Static Library (Astro functions)
 # ------------------------------
 set(BIG_FUNCTIONS_SOURCE_CANDIDATES
-    src/StationCatalog.cpp
+    src/stations/StationCatalog.cpp
+    src/stations/ElevationMask.cpp
     src/RKF45Integrator.cpp
+    src/dynamics/EphemerisInterpolator.cpp
     src/filters/filter.cpp
     src/filters/WLS.cpp
     src/observations/synth/obs_synth.cpp
@@ -152,6 +154,8 @@ set(APP_SOURCE_CANDIDATES
     station_catalog_demo.cpp
     test_stations.cpp
     test_rkf45.cpp
+    tests/test_ephemeris_interpolator.cpp
+    tests/test_rkf45_history.cpp
     tests/test_wls.cpp
     tests/test_synth_observations.cpp
     tests/test_perturbations.cpp

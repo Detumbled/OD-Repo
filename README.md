@@ -30,8 +30,12 @@ Planned or partial areas:
 ```text
 include/
   RKF45Integrator.hpp
-  StationCatalog.hpp
-  Stations.hpp
+  dynamics/
+    EphemerisInterpolator.hpp
+  stations/
+    ElevationMask.hpp
+    StationCatalog.hpp
+    Stations.hpp
   filters/
     filter.hpp
     WLS.hpp
@@ -46,7 +50,11 @@ include/
 
 src/
   RKF45Integrator.cpp
-  StationCatalog.cpp
+  dynamics/
+    EphemerisInterpolator.cpp
+  stations/
+    ElevationMask.cpp
+    StationCatalog.cpp
   filters/
     filter.cpp
     WLS.cpp
@@ -59,6 +67,8 @@ src/
     SRP.cpp
 
 tests/
+  test_ephemeris_interpolator.cpp
+  test_rkf45_history.cpp
   test_wls.cpp
   test_synth_observations.cpp
   test_perturbations.cpp
@@ -131,7 +141,7 @@ an all-test run.
 
 ### Station Catalog
 
-`StationCatalog.hpp/.cpp` provides:
+`include/stations/StationCatalog.hpp` and `src/stations/StationCatalog.cpp` provide:
 
 - `defaultDsnStationCatalog()`
 - `stationNaifIdFromName(...)`
@@ -140,6 +150,11 @@ an all-test run.
 
 Kernel loading remains the caller's responsibility. The catalog code queries
 CSPICE and returns `od::Station` objects without mutating the base station model.
+
+`include/stations/ElevationMask.hpp` and `src/stations/ElevationMask.cpp`
+compute station-target elevation from CSPICE ITRF93 geometry. The current kernel
+set does not include station topo-frame definitions such as `DSS-43_TOPO`, so
+the helper derives the local up vector from station geodetic coordinates.
 
 ### RKF45 Integrator
 
@@ -150,6 +165,10 @@ CSPICE and returns `od::Station` objects without mutating the base station model
 - Fehlberg 4(5) embedded error estimate.
 - Adaptive step acceptance/rejection.
 - Preallocated trial, fourth-order, fifth-order, and stage matrices.
+- Accepted-step history for downstream Hermite interpolation.
+
+`od::EphemerisInterpolator` stores RKF45 state and derivative nodes and evaluates
+cubic Hermite states with logarithmic interval lookup.
 
 `test_rkf45` propagates a simple circular Kepler orbit for one period and checks
 position closure, velocity closure, energy, angular momentum, and runtime.
@@ -194,14 +213,18 @@ Shared features:
 - Adds a finite-difference derivative of solar Shapiro delay using `dt = 1 s`.
 - Adds optional Gaussian range-rate noise.
 
-`test_synth_observations` generates interleaved station observations:
+`test_synth_observations` seeds the Voyager 1 state from CSPICE once, propagates
+that state with RKF45 and the same dynamics used by the OD test, applies manual
+one-way light-time and Shapiro delay against the propagated ephemeris, and
+generates elevation-filtered station observations:
 
 - Stations: DSS-43, DSS-63
-- Target: Voyager 1 (`-31`)
-- Start: `1979-03-05T00:00:00`
-- Duration: 3 hours
+- Target: Voyager 1 (`-31`), initial state seeded at arc start
+- Start: `1979-01-10T00:00:00`
+- Duration: 2 days
+- Elevation mask: 10 degrees
 - Cadence: 3 minutes
-- Samples: 122 total, 61 per station
+- Samples after mask: 828 total; DSS-43 330, DSS-63 498
 - Range sigma: 0.010 km
 - Range-rate sigma: `1.0e-6 km/s`
 
@@ -259,6 +282,8 @@ Unless otherwise noted:
 - Pure dynamics perturbation geometry uses no aberration correction (`"NONE"`).
 - Synthetic observations currently default to light-time correction (`"LT"`) and
   then add Shapiro delay explicitly.
+- The Voyager synthetic report is an exception: it uses one CSPICE initial state
+  and then RKF45-propagated truth with manual light-time iteration.
 
 ## Generated Files
 
@@ -269,26 +294,38 @@ synthetic_observations_dss43_voyager1.txt
 ```
 
 This file is useful for inspecting synthetic observation values and for checking
-whether Shapiro/noise settings changed output.
+whether light-time, Shapiro, noise, or elevation-mask settings changed output.
 
 `test_voyager_position_od` consumes that report and estimates the Voyager 1
-initial state using RKF45 with Sun gravity, Jupiter body `599`, Galilean moons
-`501-504`, Saturn barycenter `6`, SRP, light-time, and Shapiro delay. It writes:
+initial state using the same RKF45 truth dynamics as the synthetic generator:
+Sun gravity, Jupiter body `599`, Galilean moons `501-504`, Saturn barycenter
+`6`, SRP, light-time, and Shapiro delay. It writes:
 
 ```text
 tests/voyager_position_estimation_report.txt
+tests/voyager_od_postfit_diagnostics.csv
+tests/voyager_od_trajectory_error.csv
+tests/voyager_station_observability_windows.csv
 ```
+
+The CSV exports are intended for Python plotting. The post-fit diagnostics CSV
+contains final residuals and state errors at observation epochs. The trajectory
+CSV contains truth-estimate state error at the arc cadence. The observability
+CSV contains contiguous station visibility windows from the elevation-masked
+observation schedule.
 
 Latest verified `jup310.bsp` run:
 
 ```text
 Active third bodies: 599 501 502 503 504 6
 Prior position error:      70.710678 km
-Posterior position error:  51.587303 km
-Range RMS:                 37308.328 m -> 161.648 m
-Range-rate RMS:            457.768 mm/s -> 13.464 mm/s
+Posterior position error:  49.750025 km
+Range RMS:                 99187.418 m -> 9.616 m
+Range-rate RMS:            529.418 mm/s -> 1.035 mm/s
 ```
 
-This is a short-arc diagnostic test, not a final high-precision OD solution.
-Use the report residuals and future conditioning diagnostics before interpreting
-state accuracy from residual reduction alone.
+This is a diagnostic OD test, not a final high-precision solution. The longer
+visibility-filtered arc intentionally keeps state truth error as a report
+diagnostic rather than a hard test assertion; use residuals and future
+conditioning diagnostics before interpreting state accuracy from residual
+reduction alone.

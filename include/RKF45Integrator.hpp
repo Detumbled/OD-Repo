@@ -1,10 +1,13 @@
 #ifndef RKF45_INTEGRATOR_HPP
 #define RKF45_INTEGRATOR_HPP
 
+#include "dynamics/EphemerisInterpolator.hpp"
+
 #include <Eigen/Dense>
 
 #include <cstddef>
 #include <functional>
+#include <vector>
 
 namespace od {
 
@@ -28,10 +31,13 @@ public:
     };
 
     struct Result {
+        using EphemerisNode = EphemerisInterpolator::Node;
+
         State state;
         double finalTime {0.0};
         std::size_t acceptedSteps {0};
         std::size_t rejectedSteps {0};
+        std::vector<EphemerisNode> history;
     };
 
     RKF45Integrator();

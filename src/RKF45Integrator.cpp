@@ -128,10 +128,6 @@ RKF45Integrator::Result RKF45Integrator::integrate(double initialTime,
 
     validateState(initialState, "RKF45 initial state");
 
-    if (initialTime == finalTime) {
-        return Result{initialState, finalTime, 0, 0};
-    }
-
     const double direction = finalTime > initialTime ? 1.0 : -1.0;
     const double max_signed_step = direction * options_.maximumStep;
     const double min_signed_step = direction * options_.minimumStep;
@@ -142,9 +138,18 @@ RKF45Integrator::Result RKF45Integrator::integrate(double initialTime,
     State trial(initialState.size());
     State fourth_order(initialState.size());
     State fifth_order(initialState.size());
+    State accepted_derivative(initialState.size());
     StageMatrix k(initialState.size(), 6);
 
     Result result;
+    evaluateDynamics(dynamics, time, state, accepted_derivative);
+    result.history.push_back({time, state, accepted_derivative});
+
+    if (initialTime == finalTime) {
+        result.state = initialState;
+        result.finalTime = finalTime;
+        return result;
+    }
 
     while ((finalTime - time) * direction > 0.0) {
         if (result.acceptedSteps + result.rejectedSteps >= options_.maximumSteps) {
@@ -200,6 +205,8 @@ RKF45Integrator::Result RKF45Integrator::integrate(double initialTime,
             state = fifth_order;
             time += step;
             ++result.acceptedSteps;
+            evaluateDynamics(dynamics, time, state, accepted_derivative);
+            result.history.push_back({time, state, accepted_derivative});
         } else {
             ++result.rejectedSteps;
         }

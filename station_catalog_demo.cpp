@@ -1,4 +1,4 @@
-#include "StationCatalog.hpp"
+#include "stations/StationCatalog.hpp"
 
 #include <SpiceUsr.h>
 

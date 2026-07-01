@@ -1,6 +1,6 @@
 #include "observations/synth/obs_synth.hpp"
 
-#include "StationCatalog.hpp"
+#include "stations/StationCatalog.hpp"
 #include "perturbations/Shapiro.hpp"
 
 #include <SpiceUsr.h>

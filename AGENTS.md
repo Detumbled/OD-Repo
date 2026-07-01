@@ -20,20 +20,29 @@ the current project conventions, module map, and verification commands.
 
 ### Stations
 
-- `include/Stations.hpp`: base station model.
-- `include/StationCatalog.hpp`
-- `src/StationCatalog.cpp`
+- `include/stations/Stations.hpp`: base station model.
+- `include/stations/StationCatalog.hpp`
+- `include/stations/ElevationMask.hpp`
+- `src/stations/StationCatalog.cpp`
+- `src/stations/ElevationMask.cpp`
 
 Station catalog helpers map DSN names such as `DSS-43` to NAIF station IDs and
 can build station geometry from CSPICE kernels.
+Elevation-mask helpers compute station-target elevation from CSPICE station SPK
+and ITRF93 Earth-orientation geometry; this kernel set does not define
+`DSS-43_TOPO`.
 
 ### Integrator
 
 - `include/RKF45Integrator.hpp`
+- `include/dynamics/EphemerisInterpolator.hpp`
 - `src/RKF45Integrator.cpp`
+- `src/dynamics/EphemerisInterpolator.cpp`
 - `test_rkf45.cpp`
 
-Adaptive RKF45 uses Eigen states and preallocated stage storage.
+Adaptive RKF45 uses Eigen states and preallocated stage storage. The result
+history can be loaded into the Hermite ephemeris interpolator for
+propagate-once/interpolate-many observation evaluation.
 
 ### Filters
 
@@ -57,8 +66,12 @@ than explicitly forming inverse measurement covariance.
 - `tests/test_synth_observations.cpp`
 - `tests/test_voyager_position_od.cpp`
 
-Synthetic range/range-rate uses CSPICE geometry, optional Gaussian noise, and
-solar Shapiro delay. The DSS-43/DSS-63 Voyager report is generated at:
+The generic `RangeSynth`/`RangeRateSynth` classes use CSPICE geometry, optional
+Gaussian noise, and solar Shapiro delay. The Voyager synthetic test now seeds
+Voyager's initial state from CSPICE once, propagates it with RKF45 and the OD
+dynamics, applies manual one-way light-time against that propagated ephemeris,
+and keeps only samples above the station elevation mask. The DSS-43/DSS-63
+Voyager report is generated at:
 
 ```text
 synthetic_observations_dss43_voyager1.txt
@@ -149,29 +162,34 @@ SRP acceleration norm                = 2.941469913405e-12 km/s^2
 ```text
 Stations: DSS-43, DSS-63
 Target: Voyager 1 (-31)
-Arc: 1979-03-05T00:00:00 to 1979-03-05T03:00:00
+Requested arc: 1979-01-10T00:00:00 to 1979-01-12T00:00:00
+Elevation mask: 10 deg
 Cadence: 180 s
-Samples: 122 total, 61 per station
+Samples after mask: 828 total; DSS-43 330, DSS-63 498
 Range sigma: 0.010 km
 Range-rate sigma: 1.0e-6 km/s
 ```
 
 `test_voyager_position_od` reads that report and estimates the initial Voyager
-state with RKF45, Sun gravity, Jupiter body `599`, Galilean moons `501-504`,
-Saturn barycenter `6`, SRP, light-time, and Shapiro delay. Its debug report is
-generated at `tests/voyager_position_estimation_report.txt`.
+state with the same RKF45 truth dynamics used by the synthetic generator:
+Sun gravity, Jupiter body `599`, Galilean moons `501-504`, Saturn barycenter
+`6`, SRP, light-time, and Shapiro delay. Its debug report is generated at
+`tests/voyager_position_estimation_report.txt`. It also exports plotting CSVs:
+`tests/voyager_od_postfit_diagnostics.csv`,
+`tests/voyager_od_trajectory_error.csv`, and
+`tests/voyager_station_observability_windows.csv`.
 
 Latest verified `jup310.bsp` run:
 
 ```text
 Active third bodies: 599 501 502 503 504 6
 Prior position error:      70.710678 km
-Posterior position error:  51.587303 km
-Prefit range RMS:          37308.328 m
-Postfit range RMS:         161.648 m
-Prefit range-rate RMS:     457.768 mm/s
-Postfit range-rate RMS:    13.464 mm/s
-OD test runtime:           about 129 s
+Posterior position error:  49.750025 km
+Prefit range RMS:          99187.418 m
+Postfit range RMS:         9.616 m
+Prefit range-rate RMS:     529.418 mm/s
+Postfit range-rate RMS:    1.035 mm/s
+OD test runtime:           about 80 s
 ```
 
 ## Worktree Caution

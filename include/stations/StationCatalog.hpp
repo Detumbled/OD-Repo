@@ -1,7 +1,7 @@
 #ifndef STATION_CATALOG_HPP
 #define STATION_CATALOG_HPP
 
-#include "Stations.hpp"
+#include "stations/Stations.hpp"
 
 #include <string>
 #include <unordered_map>
