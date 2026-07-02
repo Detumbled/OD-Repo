@@ -12,7 +12,7 @@ Implemented modules:
 - CSPICE-backed DSN station catalog.
 - Adaptive RKF45 integrator using Eigen vectors and preallocated stage storage.
 - Batch Weighted Least Squares filter with a priori information.
-- Synthetic one-way range and range-rate observations.
+- Synthetic one-way range, range-rate, and VLBI differential range observations.
 - Solar Shapiro delay applied to synthetic radiometric observables.
 - Modular perturbation models for third-body gravity and cannonball SRP.
 - Focused tests for RKF45, WLS, synthetic observations, perturbations,
@@ -43,6 +43,7 @@ include/
     obs_synth.hpp
     RangeSynth.hpp
     RangeRateSynth.hpp
+    VLBISynth.hpp
   perturbations/
     Gravitational.hpp
     SRP.hpp
@@ -62,6 +63,7 @@ src/
     obs_synth.cpp
     RangeSynth.cpp
     RangeRateSynth.cpp
+    VLBISynth.cpp
   perturbations/
     Gravitational.cpp
     SRP.cpp
@@ -86,7 +88,6 @@ The CMake project currently uses C++23 and links these dependencies:
 
 - Eigen3
 - CSPICE
-- Ceres
 - GLFW, GLEW, OpenGL
 - local `third_party/imgui`, `third_party/implot`, and `third_party/glm`
 
@@ -213,10 +214,17 @@ Shared features:
 - Adds a finite-difference derivative of solar Shapiro delay using `dt = 1 s`.
 - Adds optional Gaussian range-rate noise.
 
+`VLBISynth`:
+
+- Generates differential one-way range (`station2 - station1`) for a station pair.
+- Keeps samples only when the target is visible from both stations.
+- Applies the same one-way light-time and solar Shapiro treatment used by the range observable.
+- Adds optional Gaussian VLBI delay noise in km.
+
 `test_synth_observations` seeds the Voyager 1 state from CSPICE once, propagates
 that state with RKF45 and the same dynamics used by the OD test, applies manual
 one-way light-time and Shapiro delay against the propagated ephemeris, and
-generates elevation-filtered station observations:
+generates elevation-filtered station and VLBI observations:
 
 - Stations: DSS-43, DSS-63
 - Target: Voyager 1 (`-31`), initial state seeded at arc start
@@ -225,8 +233,10 @@ generates elevation-filtered station observations:
 - Elevation mask: 10 degrees
 - Cadence: 3 minutes
 - Samples after mask: 828 total; DSS-43 330, DSS-63 498
+- VLBI samples after dual-station visibility mask: 5
 - Range sigma: 0.010 km
 - Range-rate sigma: `1.0e-6 km/s`
+- VLBI sigma: 0.001 km
 
 The output report keeps the historical filename but now includes a `station`
 column:
@@ -303,25 +313,27 @@ Sun gravity, Jupiter body `599`, Galilean moons `501-504`, Saturn barycenter
 
 ```text
 tests/voyager_position_estimation_report.txt
-tests/voyager_od_postfit_diagnostics.csv
-tests/voyager_od_trajectory_error.csv
-tests/voyager_station_observability_windows.csv
+tests/voyager_od_postfit_diagnostics_VLBI.csv
+tests/voyager_od_trajectory_error_VLBI.csv
+tests/voyager_station_observability_windows_VLBI.csv
 ```
 
 The CSV exports are intended for Python plotting. The post-fit diagnostics CSV
 contains final residuals and state errors at observation epochs. The trajectory
 CSV contains truth-estimate state error at the arc cadence. The observability
 CSV contains contiguous station visibility windows from the elevation-masked
-observation schedule.
+observation schedule. Historical non-VLBI CSVs without the `_VLBI` suffix may be
+kept for comparison plots.
 
 Latest verified `jup310.bsp` run:
 
 ```text
 Active third bodies: 599 501 502 503 504 6
 Prior position error:      70.710678 km
-Posterior position error:  49.750025 km
-Range RMS:                 99187.418 m -> 9.616 m
-Range-rate RMS:            529.418 mm/s -> 1.035 mm/s
+Posterior position error:  42.261878 km
+Range RMS:                 99187.418 m -> 9.596 m
+Range-rate RMS:            529.418 mm/s -> 1.018 mm/s
+VLBI RMS:                  1.643 m -> 1.079 m
 ```
 
 This is a diagnostic OD test, not a final high-precision solution. The longer

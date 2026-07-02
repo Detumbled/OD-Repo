@@ -60,10 +60,16 @@ public:
 protected:
     [[nodiscard]] Eigen::Matrix<double, 6, 1> relativeTargetState(double epochTdb) const;
     [[nodiscard]] RelativeGeometry relativeTargetGeometry(double receiveEpochTdb) const;
+    [[nodiscard]] RelativeGeometry relativeTargetGeometryFor(const std::string& target,
+                                                             const std::string& stationName,
+                                                             double receiveEpochTdb) const;
     [[nodiscard]] Eigen::Matrix<double, 6, 1> sunRelativeState(const std::string& body,
                                                               double epochTdb) const;
     [[nodiscard]] double shapiroRangeDelay(double receiveEpochTdb) const;
     [[nodiscard]] double shapiroRangeDelay(const RelativeGeometry& geometry) const;
+    [[nodiscard]] double shapiroRangeDelayFor(const std::string& target,
+                                              const std::string& stationName,
+                                              const RelativeGeometry& geometry) const;
     [[nodiscard]] double drawNoise();
 
     GeometryConfig geometry_;

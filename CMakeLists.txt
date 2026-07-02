@@ -22,7 +22,6 @@ find_package(Eigen3 CONFIG REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(GLEW REQUIRED)
 find_package(OpenGL REQUIRED)
-find_package(Ceres CONFIG REQUIRED)
 
 message(STATUS "Graphics Libraries Found:")
 message(STATUS "  GLFW: ${glfw3_DIR}")
@@ -106,7 +105,6 @@ target_link_libraries(project_dependencies INTERFACE
     GLEW::GLEW
     ${OPENGL_LIBRARIES}
     imgui_lib          
-    Ceres::ceres
     m
 )
 
@@ -131,6 +129,7 @@ set(BIG_FUNCTIONS_SOURCE_CANDIDATES
     src/observations/synth/obs_synth.cpp
     src/observations/synth/RangeSynth.cpp
     src/observations/synth/RangeRateSynth.cpp
+    src/observations/synth/VLBISynth.cpp
     src/perturbations/Gravitational.cpp
     src/perturbations/SRP.cpp
 )

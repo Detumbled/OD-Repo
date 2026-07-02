@@ -154,17 +154,29 @@ Eigen::Matrix<double, 6, 1> SyntheticObservation::relativeTargetState(double epo
 }
 
 RelativeGeometry SyntheticObservation::relativeTargetGeometry(double receiveEpochTdb) const {
+    return relativeTargetGeometryFor(geometry_.target, geometry_.stationName, receiveEpochTdb);
+}
+
+RelativeGeometry SyntheticObservation::relativeTargetGeometryFor(const std::string& target,
+                                                                 const std::string& stationName,
+                                                                 double receiveEpochTdb) const {
+    if (target.empty()) {
+        throw std::invalid_argument("Synthetic observation target cannot be empty.");
+    }
+    if (stationName.empty()) {
+        throw std::invalid_argument("Synthetic observation station name cannot be empty.");
+    }
     if (!std::isfinite(receiveEpochTdb)) {
         throw std::invalid_argument("Synthetic observation epoch must be finite.");
     }
 
     SpiceErrorActionGuard action_guard;
 
-    const std::string observer = stationTargetName(geometry_.stationName);
+    const std::string observer = stationTargetName(stationName);
     SpiceDouble spice_state[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     SpiceDouble light_time = 0.0;
 
-    spkezr_c(geometry_.target.c_str(),
+    spkezr_c(target.c_str(),
              receiveEpochTdb,
              geometry_.frame.c_str(),
              geometry_.aberrationCorrection.c_str(),
@@ -172,7 +184,7 @@ RelativeGeometry SyntheticObservation::relativeTargetGeometry(double receiveEpoc
              spice_state,
              &light_time);
 
-    throwIfSpiceFailed("Failed to compute synthetic observation geometry for station " + geometry_.stationName);
+    throwIfSpiceFailed("Failed to compute synthetic observation geometry for station " + stationName);
 
     RelativeGeometry geometry;
     geometry.lightTimeSec = light_time;
@@ -223,10 +235,23 @@ double SyntheticObservation::shapiroRangeDelay(double receiveEpochTdb) const {
 }
 
 double SyntheticObservation::shapiroRangeDelay(const RelativeGeometry& geometry) const {
-    const std::string observer = stationTargetName(geometry_.stationName);
+    return shapiroRangeDelayFor(geometry_.target, geometry_.stationName, geometry);
+}
+
+double SyntheticObservation::shapiroRangeDelayFor(const std::string& target,
+                                                  const std::string& stationName,
+                                                  const RelativeGeometry& geometry) const {
+    if (target.empty()) {
+        throw std::invalid_argument("Synthetic observation Shapiro target cannot be empty.");
+    }
+    if (stationName.empty()) {
+        throw std::invalid_argument("Synthetic observation Shapiro station cannot be empty.");
+    }
+
+    const std::string observer = stationTargetName(stationName);
     const Eigen::Matrix<double, 6, 1> observer_sun_state = sunRelativeState(observer,
                                                                             geometry.receiveEpochTdb);
-    const Eigen::Matrix<double, 6, 1> target_sun_state = sunRelativeState(geometry_.target,
+    const Eigen::Matrix<double, 6, 1> target_sun_state = sunRelativeState(target,
                                                                           geometry.emitEpochTdb);
 
     const Eigen::Vector3d observer_from_sun = observer_sun_state.segment<3>(0);

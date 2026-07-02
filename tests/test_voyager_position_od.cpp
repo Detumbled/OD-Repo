@@ -59,11 +59,12 @@ constexpr double kEphemerisLightTimePaddingSec = 600.0;
 constexpr int kMaxSolverIterations = 5;
 constexpr double kAdoptedRangeSigmaFloorKm = 0.05; //50 meters
 constexpr double kAdoptedRangeRateSigmaFloorKmPerSec = 1.0e-4; //
+constexpr double kAdoptedVLBISigmaFloorKm = 0.001;
 
 constexpr const char* kReportPath = "../tests/voyager_position_estimation_report.txt";
-constexpr const char* kPostfitDiagnosticsCsvPath = "../tests/voyager_od_postfit_diagnostics.csv";
-constexpr const char* kTrajectoryErrorCsvPath = "../tests/voyager_od_trajectory_error.csv";
-constexpr const char* kObservabilityWindowsCsvPath = "../tests/voyager_station_observability_windows.csv";
+constexpr const char* kPostfitDiagnosticsCsvPath = "../tests/voyager_od_postfit_diagnostics_VLBI.csv";
+constexpr const char* kTrajectoryErrorCsvPath = "../tests/voyager_od_trajectory_error_VLBI.csv";
+constexpr const char* kObservabilityWindowsCsvPath = "../tests/voyager_station_observability_windows_VLBI.csv";
 
 struct Observation {
     std::string utc;
@@ -80,6 +81,24 @@ struct Observation {
     double rangeRateSigmaKmPerSec {0.0};
 };
 
+struct VlbiObservation {
+    std::string utc;
+    std::string stationOneName;
+    std::string stationTwoName;
+    std::string stationOneNaif;
+    std::string stationTwoNaif;
+    double epochTdb {0.0};
+    double delayTruthKm {0.0};
+    double delayNoiseKm {0.0};
+    double delayObservedKm {0.0};
+    double delaySigmaKm {0.0};
+};
+
+struct ObservationReport {
+    std::vector<Observation> stationObservations;
+    std::vector<VlbiObservation> vlbiObservations;
+};
+
 struct ComputedRange {
     double rangeKm {0.0};
     double geometricRangeKm {0.0};
@@ -93,11 +112,14 @@ struct ComputedRange {
 struct Prediction {
     Eigen::VectorXd values;
     std::vector<ComputedRange> ranges;
+    std::vector<ComputedRange> vlbiStationOneRanges;
+    std::vector<ComputedRange> vlbiStationTwoRanges;
 };
 
 struct ResidualStats {
     double rangeRmsKm {0.0};
     double rangeRateRmsKmPerSec {0.0};
+    double vlbiRmsKm {0.0};
     double weightedRms {0.0};
 };
 
@@ -106,6 +128,7 @@ struct IterationRecord {
     double weightedRms {0.0};
     double rangeRmsKm {0.0};
     double rangeRateRmsKmPerSec {0.0};
+    double vlbiRmsKm {0.0};
     double correctionPositionNormKm {0.0};
     double correctionVelocityNormKmPerSec {0.0};
     double positionErrorKm {0.0};
@@ -189,13 +212,13 @@ void throwIfSpiceFailed(const std::string& context) {
     return utc;
 }
 
-[[nodiscard]] std::vector<Observation> readObservationReport(const std::filesystem::path& path) {
+[[nodiscard]] ObservationReport readObservationReport(const std::filesystem::path& path) {
     std::ifstream input(path);
     if (!input) {
         throw std::runtime_error("Failed to open observation report: " + path.string());
     }
 
-    std::vector<Observation> observations;
+    ObservationReport report;
     std::string line;
     while (std::getline(input, line)) {
         if (line.empty() || line.front() == '#') {
@@ -203,9 +226,9 @@ void throwIfSpiceFailed(const std::string& context) {
         }
 
         std::istringstream parser(line);
-        Observation observation;
+        std::string utc_token;
         std::string epoch_or_station;
-        parser >> observation.utc
+        parser >> utc_token
                >> epoch_or_station;
 
         if (!parser) {
@@ -213,6 +236,32 @@ void throwIfSpiceFailed(const std::string& context) {
         }
 
         double parsed_epoch = 0.0;
+        if (epoch_or_station == "VLBI") {
+            VlbiObservation vlbiObservation;
+            vlbiObservation.utc = utc_token;
+            parser >> vlbiObservation.stationOneName
+                   >> vlbiObservation.stationTwoName
+                   >> vlbiObservation.epochTdb
+                   >> vlbiObservation.delayTruthKm
+                   >> vlbiObservation.delayNoiseKm
+                   >> vlbiObservation.delayObservedKm
+                   >> vlbiObservation.delaySigmaKm;
+
+            if (!parser) {
+                throw std::runtime_error("Failed to parse VLBI observation row: " + line);
+            }
+            if (vlbiObservation.delaySigmaKm <= 0.0) {
+                throw std::runtime_error("VLBI observation row has non-positive sigma: " + line);
+            }
+
+            vlbiObservation.stationOneNaif = stationNaifFromName(vlbiObservation.stationOneName);
+            vlbiObservation.stationTwoNaif = stationNaifFromName(vlbiObservation.stationTwoName);
+            report.vlbiObservations.push_back(std::move(vlbiObservation));
+            continue;
+        }
+
+        Observation observation;
+        observation.utc = std::move(utc_token);
         if (parseDoubleToken(epoch_or_station, parsed_epoch)) {
             observation.stationName = kDefaultStationName;
             observation.stationNaif = kDefaultStationNaif;
@@ -239,14 +288,14 @@ void throwIfSpiceFailed(const std::string& context) {
             throw std::runtime_error("Observation row has non-positive sigma: " + line);
         }
 
-        observations.push_back(std::move(observation));
+        report.stationObservations.push_back(std::move(observation));
     }
 
-    if (observations.size() < 4) {
+    if (report.stationObservations.size() < 4) {
         throw std::runtime_error("Observation report does not contain enough samples for OD.");
     }
 
-    return observations;
+    return report;
 }
 
 [[nodiscard]] State6 spiceState(const std::string& target,
@@ -428,8 +477,14 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
     return maximumRangeKm / fd::perturbations::kSpeedOfLightKmPerSec;
 }
 
+[[nodiscard]] Eigen::Index measurementCount(const std::vector<Observation>& observations,
+                                            const std::vector<VlbiObservation>& vlbiObservations) {
+    return static_cast<Eigen::Index>(2 * observations.size() + vlbiObservations.size());
+}
+
 [[nodiscard]] std::pair<double, double> ephemerisBoundsForObservations(
-    const std::vector<Observation>& observations) {
+    const std::vector<Observation>& observations,
+    const std::vector<VlbiObservation>& vlbiObservations) {
     if (observations.empty()) {
         throw std::invalid_argument("Cannot build an ephemeris span for an empty observation set.");
     }
@@ -437,6 +492,10 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
     double firstEpoch = observations.front().epochTdb;
     double lastEpoch = observations.front().epochTdb;
     for (const Observation& observation : observations) {
+        firstEpoch = std::min(firstEpoch, observation.epochTdb);
+        lastEpoch = std::max(lastEpoch, observation.epochTdb);
+    }
+    for (const VlbiObservation& observation : vlbiObservations) {
         firstEpoch = std::min(firstEpoch, observation.epochTdb);
         lastEpoch = std::max(lastEpoch, observation.epochTdb);
     }
@@ -449,11 +508,12 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
 
 [[nodiscard]] od::EphemerisInterpolator propagateObservationEphemeris(
     const std::vector<Observation>& observations,
+    const std::vector<VlbiObservation>& vlbiObservations,
     const od::RKF45Integrator& integrator,
     const od::RKF45Integrator::DerivativeFunction& dynamics,
     double referenceEpoch,
     const State6& referenceState) {
-    const auto [startEpoch, finalEpoch] = ephemerisBoundsForObservations(observations);
+    const auto [startEpoch, finalEpoch] = ephemerisBoundsForObservations(observations, vlbiObservations);
     return propagateEphemerisSpan(integrator,
                                   dynamics,
                                   referenceEpoch,
@@ -505,20 +565,24 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
 }
 
 [[nodiscard]] Prediction predictObservations(const std::vector<Observation>& observations,
+                                             const std::vector<VlbiObservation>& vlbiObservations,
                                              const od::RKF45Integrator& integrator,
                                              const od::RKF45Integrator::DerivativeFunction& dynamics,
                                              double referenceEpoch,
                                              const State6& referenceState) {
     const od::EphemerisInterpolator spacecraftEphemeris =
         propagateObservationEphemeris(observations,
+                                      vlbiObservations,
                                       integrator,
                                       dynamics,
                                       referenceEpoch,
                                       referenceState);
 
     Prediction prediction;
-    prediction.values.resize(static_cast<Eigen::Index>(2 * observations.size()));
+    prediction.values.resize(measurementCount(observations, vlbiObservations));
     prediction.ranges.reserve(observations.size());
+    prediction.vlbiStationOneRanges.reserve(vlbiObservations.size());
+    prediction.vlbiStationTwoRanges.reserve(vlbiObservations.size());
 
     for (std::size_t i = 0; i < observations.size(); ++i) {
         const ComputedRange range = computeRangeAtReceiveEpoch(spacecraftEphemeris,
@@ -535,21 +599,45 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
         prediction.ranges.push_back(range);
     }
 
+    const Eigen::Index vlbiOffset = static_cast<Eigen::Index>(2 * observations.size());
+    for (std::size_t i = 0; i < vlbiObservations.size(); ++i) {
+        const VlbiObservation& observation = vlbiObservations[i];
+        const ComputedRange stationOneRange =
+            computeRangeAtReceiveEpoch(spacecraftEphemeris,
+                                       observation.stationOneNaif,
+                                       observation.epochTdb);
+        const ComputedRange stationTwoRange =
+            computeRangeAtReceiveEpoch(spacecraftEphemeris,
+                                       observation.stationTwoNaif,
+                                       observation.epochTdb);
+
+        prediction.values[vlbiOffset + static_cast<Eigen::Index>(i)] =
+            stationTwoRange.rangeKm - stationOneRange.rangeKm;
+        prediction.vlbiStationOneRanges.push_back(stationOneRange);
+        prediction.vlbiStationTwoRanges.push_back(stationTwoRange);
+    }
+
     return prediction;
 }
 
-[[nodiscard]] Eigen::VectorXd measuredVector(const std::vector<Observation>& observations) {
-    Eigen::VectorXd measured(static_cast<Eigen::Index>(2 * observations.size()));
+[[nodiscard]] Eigen::VectorXd measuredVector(const std::vector<Observation>& observations,
+                                             const std::vector<VlbiObservation>& vlbiObservations) {
+    Eigen::VectorXd measured(measurementCount(observations, vlbiObservations));
     for (std::size_t i = 0; i < observations.size(); ++i) {
         measured[static_cast<Eigen::Index>(2 * i)] = observations[i].rangeObservedKm;
         measured[static_cast<Eigen::Index>(2 * i + 1)] = observations[i].rangeRateObservedKmPerSec;
     }
+    const Eigen::Index vlbiOffset = static_cast<Eigen::Index>(2 * observations.size());
+    for (std::size_t i = 0; i < vlbiObservations.size(); ++i) {
+        measured[vlbiOffset + static_cast<Eigen::Index>(i)] = vlbiObservations[i].delayObservedKm;
+    }
     return measured;
 }
 
-[[nodiscard]] Eigen::MatrixXd measurementCovariance(const std::vector<Observation>& observations) {
-    Eigen::MatrixXd covariance = Eigen::MatrixXd::Zero(static_cast<Eigen::Index>(2 * observations.size()),
-                                                       static_cast<Eigen::Index>(2 * observations.size()));
+[[nodiscard]] Eigen::MatrixXd measurementCovariance(const std::vector<Observation>& observations,
+                                                    const std::vector<VlbiObservation>& vlbiObservations) {
+    const Eigen::Index count = measurementCount(observations, vlbiObservations);
+    Eigen::MatrixXd covariance = Eigen::MatrixXd::Zero(count, count);
     for (std::size_t i = 0; i < observations.size(); ++i) {
         const double adoptedRangeSigmaKm = std::max(observations[i].rangeSigmaKm,
                                                     kAdoptedRangeSigmaFloorKm);
@@ -561,11 +649,20 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
         covariance(static_cast<Eigen::Index>(2 * i + 1), static_cast<Eigen::Index>(2 * i + 1)) =
             adoptedRangeRateSigmaKmPerSec * adoptedRangeRateSigmaKmPerSec;
     }
+    const Eigen::Index vlbiOffset = static_cast<Eigen::Index>(2 * observations.size());
+    for (std::size_t i = 0; i < vlbiObservations.size(); ++i) {
+        const double adoptedVLBISigmaKm = std::max(vlbiObservations[i].delaySigmaKm,
+                                                   kAdoptedVLBISigmaFloorKm);
+        covariance(vlbiOffset + static_cast<Eigen::Index>(i),
+                   vlbiOffset + static_cast<Eigen::Index>(i)) =
+            adoptedVLBISigmaKm * adoptedVLBISigmaKm;
+    }
     return covariance;
 }
 
 [[nodiscard]] Eigen::MatrixXd finiteDifferenceDesignMatrix(
     const std::vector<Observation>& observations,
+    const std::vector<VlbiObservation>& vlbiObservations,
     const od::RKF45Integrator& integrator,
     const od::RKF45Integrator::DerivativeFunction& dynamics,
     double referenceEpoch,
@@ -573,7 +670,7 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
     Eigen::Matrix<double, 6, 1> perturbationSteps;
     perturbationSteps << 1.0, 1.0, 1.0, 1.0e-4, 1.0e-4, 1.0e-4;
 
-    Eigen::MatrixXd design(static_cast<Eigen::Index>(2 * observations.size()), 6);
+    Eigen::MatrixXd design(measurementCount(observations, vlbiObservations), 6);
 
     for (Eigen::Index column = 0; column < 6; ++column) {
         State6 plusState = nominalState;
@@ -582,9 +679,19 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
         minusState[column] -= perturbationSteps[column];
 
         const Eigen::VectorXd plus =
-            predictObservations(observations, integrator, dynamics, referenceEpoch, plusState).values;
+            predictObservations(observations,
+                                vlbiObservations,
+                                integrator,
+                                dynamics,
+                                referenceEpoch,
+                                plusState).values;
         const Eigen::VectorXd minus =
-            predictObservations(observations, integrator, dynamics, referenceEpoch, minusState).values;
+            predictObservations(observations,
+                                vlbiObservations,
+                                integrator,
+                                dynamics,
+                                referenceEpoch,
+                                minusState).values;
 
         design.col(column) = (plus - minus) / (2.0 * perturbationSteps[column]);
     }
@@ -597,13 +704,15 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
 }
 
 [[nodiscard]] ResidualStats computeStats(const Eigen::VectorXd& residuals,
-                                         const std::vector<Observation>& observations) {
-    if (residuals.size() != static_cast<Eigen::Index>(2 * observations.size())) {
+                                         const std::vector<Observation>& observations,
+                                         const std::vector<VlbiObservation>& vlbiObservations) {
+    if (residuals.size() != measurementCount(observations, vlbiObservations)) {
         throw std::runtime_error("Residual vector has inconsistent size.");
     }
 
     double rangeSum = 0.0;
     double rangeRateSum = 0.0;
+    double vlbiSum = 0.0;
     double weightedSum = 0.0;
 
     for (std::size_t i = 0; i < observations.size(); ++i) {
@@ -616,10 +725,19 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
             + std::pow(rangeRateResidual / observations[i].rangeRateSigmaKmPerSec, 2.0);
     }
 
+    const Eigen::Index vlbiOffset = static_cast<Eigen::Index>(2 * observations.size());
+    for (std::size_t i = 0; i < vlbiObservations.size(); ++i) {
+        const double vlbiResidual = residuals[vlbiOffset + static_cast<Eigen::Index>(i)];
+        vlbiSum += vlbiResidual * vlbiResidual;
+        weightedSum += std::pow(vlbiResidual / vlbiObservations[i].delaySigmaKm, 2.0);
+    }
+
     const double count = static_cast<double>(observations.size());
+    const double vlbiCount = static_cast<double>(vlbiObservations.size());
     return ResidualStats{
         std::sqrt(rangeSum / count),
         std::sqrt(rangeRateSum / count),
+        vlbiObservations.empty() ? 0.0 : std::sqrt(vlbiSum / vlbiCount),
         std::sqrt(weightedSum / static_cast<double>(residuals.size()))
     };
 }
@@ -863,6 +981,7 @@ void writeObservabilityWindowsCsv(const std::filesystem::path& path,
 void writeReport(const std::filesystem::path& path,
                  const std::filesystem::path& observationPath,
                  const std::vector<Observation>& observations,
+                 const std::vector<VlbiObservation>& vlbiObservations,
                  const std::vector<IterationRecord>& iterations,
                  const Prediction& prefitPrediction,
                  const Prediction& postfitPrediction,
@@ -883,9 +1002,11 @@ void writeReport(const std::filesystem::path& path,
 
     const State6 priorError = priorState - truthState;
     const State6 estimatedError = estimatedState - truthState;
-    const Eigen::VectorXd measured = measuredVector(observations);
-    const ResidualStats prefitStats = computeStats(measured - prefitPrediction.values, observations);
-    const ResidualStats postfitStats = computeStats(measured - postfitPrediction.values, observations);
+    const Eigen::VectorXd measured = measuredVector(observations, vlbiObservations);
+    const ResidualStats prefitStats =
+        computeStats(measured - prefitPrediction.values, observations, vlbiObservations);
+    const ResidualStats postfitStats =
+        computeStats(measured - postfitPrediction.values, observations, vlbiObservations);
     const std::vector<std::string> stationLabels = uniqueStationLabels(observations);
 
     report << std::scientific << std::setprecision(12);
@@ -896,6 +1017,8 @@ void writeReport(const std::filesystem::path& path,
         report << ' ' << stationLabel;
     }
     report << '\n'
+           << "# station_observation_count: " << observations.size() << '\n'
+           << "# vlbi_observation_count: " << vlbiObservations.size() << '\n'
            << "# target: Voyager 1 (" << kTarget << ")\n"
            << "# reference_epoch_tdb: " << referenceEpoch << '\n'
            << "# dynamics: Sun central gravity + covered third bodies + cannonball SRP\n"
@@ -912,10 +1035,11 @@ void writeReport(const std::filesystem::path& path,
     }
     report << '\n'
            << "# truth_model: initial CSPICE Voyager state propagated with the same RKF45 dynamics used by OD\n"
-           << "# observation_model: Hermite-interpolated one-way light-time + solar Shapiro + finite-difference range-rate\n"
+           << "# observation_model: Hermite-interpolated one-way light-time + solar Shapiro + finite-difference range-rate + station2-minus-station1 VLBI delay\n"
            << "# covariance_note: WLS uses sigma floors for simplified-dynamics model error; raw residuals below still use the input observations\n"
            << "# adopted_range_sigma_floor_km: " << kAdoptedRangeSigmaFloorKm << '\n'
            << "# adopted_range_rate_sigma_floor_km_s: " << kAdoptedRangeRateSigmaFloorKmPerSec << '\n'
+           << "# adopted_vlbi_sigma_floor_km: " << kAdoptedVLBISigmaFloorKm << '\n'
            << "# SRP: CR=" << kVoyagerReflectivity
            << " area_m2=" << kVoyagerAreaM2
            << " mass_kg=" << kVoyagerMassKg << '\n'
@@ -933,10 +1057,12 @@ void writeReport(const std::filesystem::path& path,
            << "# postfit_range_rms_m: " << postfitStats.rangeRmsKm * 1000.0 << '\n'
            << "# prefit_range_rate_rms_mm_s: " << prefitStats.rangeRateRmsKmPerSec * 1.0e6 << '\n'
            << "# postfit_range_rate_rms_mm_s: " << postfitStats.rangeRateRmsKmPerSec * 1.0e6 << '\n'
+           << "# prefit_vlbi_rms_m: " << prefitStats.vlbiRmsKm * 1000.0 << '\n'
+           << "# postfit_vlbi_rms_m: " << postfitStats.vlbiRmsKm * 1000.0 << '\n'
            << "# prefit_weighted_rms: " << prefitStats.weightedRms << '\n'
            << "# postfit_weighted_rms: " << postfitStats.weightedRms << '\n'
            << "# posterior_covariance_diag: " << covariance.diagonal().transpose() << '\n'
-           << "# iterations: iteration weighted_rms range_rms_m range_rate_rms_mm_s "
+           << "# iterations: iteration weighted_rms range_rms_m range_rate_rms_mm_s vlbi_rms_m "
               "correction_pos_m correction_vel_mm_s position_error_km velocity_error_km_s\n";
 
     for (const IterationRecord& record : iterations) {
@@ -945,6 +1071,7 @@ void writeReport(const std::filesystem::path& path,
                << record.weightedRms << ' '
                << record.rangeRmsKm * 1000.0 << ' '
                << record.rangeRateRmsKmPerSec * 1.0e6 << ' '
+               << record.vlbiRmsKm * 1000.0 << ' '
                << record.correctionPositionNormKm * 1000.0 << ' '
                << record.correctionVelocityNormKmPerSec * 1.0e6 << ' '
                << record.positionErrorKm << ' '
@@ -993,6 +1120,29 @@ void writeReport(const std::filesystem::path& path,
                << propagatedError.segment<3>(0).norm() << ' '
                << propagatedError.segment<3>(3).norm() << '\n';
     }
+
+    report << "# vlbi_columns: utc station1 station2 epoch_tdb obs_vlbi_km truth_vlbi_km "
+              "prefit_vlbi_km postfit_vlbi_km prefit_vlbi_residual_m postfit_vlbi_residual_m "
+              "vlbi_sigma_km station1_light_time_s station2_light_time_s\n";
+
+    const Eigen::Index vlbiOffset = static_cast<Eigen::Index>(2 * observations.size());
+    for (std::size_t i = 0; i < vlbiObservations.size(); ++i) {
+        const VlbiObservation& observation = vlbiObservations[i];
+        const Eigen::Index row = vlbiOffset + static_cast<Eigen::Index>(i);
+        report << observation.utc << ' '
+               << observation.stationOneName << ' '
+               << observation.stationTwoName << ' '
+               << observation.epochTdb << ' '
+               << observation.delayObservedKm << ' '
+               << observation.delayTruthKm << ' '
+               << prefitPrediction.values[row] << ' '
+               << postfitPrediction.values[row] << ' '
+               << (observation.delayObservedKm - prefitPrediction.values[row]) * 1000.0 << ' '
+               << (observation.delayObservedKm - postfitPrediction.values[row]) * 1000.0 << ' '
+               << observation.delaySigmaKm << ' '
+               << postfitPrediction.vlbiStationOneRanges[i].lightTimeSec << ' '
+               << postfitPrediction.vlbiStationTwoRanges[i].lightTimeSec << '\n';
+    }
 }
 
 } // namespace
@@ -1011,7 +1161,12 @@ int main() {
                 "../../synthetic_observations_dss43_voyager1.txt"
             },
             "synthetic Voyager observation report");
-        const std::vector<Observation> observations = readObservationReport(observationPath);
+        const ObservationReport observationReport = readObservationReport(observationPath);
+        const std::vector<Observation>& observations = observationReport.stationObservations;
+        const std::vector<VlbiObservation>& vlbiObservations = observationReport.vlbiObservations;
+        if (vlbiObservations.empty()) {
+            throw std::runtime_error("Observation report does not contain VLBI measurements.");
+        }
         const double referenceEpoch = observations.front().epochTdb;
         const State6 truthState = spiceState(kTarget, referenceEpoch, kCentralBody, "NONE");
 
@@ -1036,7 +1191,7 @@ int main() {
         std::vector<std::string> activeThirdBodies;
         std::vector<std::string> skippedThirdBodies;
         const auto [dynamicsStartEpoch, dynamicsFinalEpoch] =
-            ephemerisBoundsForObservations(observations);
+            ephemerisBoundsForObservations(observations, vlbiObservations);
 
         addThirdBodyIfCovered(thirdBody,
                               {kJupiter, kJupiterBodyMuKm3PerSec2},
@@ -1089,6 +1244,7 @@ int main() {
         const auto dynamics = makeDynamics(thirdBody, srp);
         const od::EphemerisInterpolator truthEphemeris =
             propagateObservationEphemeris(observations,
+                                          vlbiObservations,
                                           integrator,
                                           dynamics,
                                           referenceEpoch,
@@ -1101,9 +1257,10 @@ int main() {
         fd::filters::WLS filter(kCentralBody);
         filter.setInitialState(priorState, priorCovariance, referenceEpoch);
 
-        const Eigen::VectorXd measured = measuredVector(observations);
-        const Eigen::MatrixXd covariance = measurementCovariance(observations);
+        const Eigen::VectorXd measured = measuredVector(observations, vlbiObservations);
+        const Eigen::MatrixXd covariance = measurementCovariance(observations, vlbiObservations);
         const Prediction prefitPrediction = predictObservations(observations,
+                                                                vlbiObservations,
                                                                 integrator,
                                                                 dynamics,
                                                                 referenceEpoch,
@@ -1113,13 +1270,15 @@ int main() {
         for (int iteration = 0; iteration < kMaxSolverIterations; ++iteration) {
             const State6 currentState = stateAtEpoch(filter);
             const Prediction prediction = predictObservations(observations,
+                                                              vlbiObservations,
                                                               integrator,
                                                               dynamics,
                                                               referenceEpoch,
                                                               currentState);
             const Eigen::VectorXd residuals = measured - prediction.values;
-            const ResidualStats stats = computeStats(residuals, observations);
+            const ResidualStats stats = computeStats(residuals, observations, vlbiObservations);
             const Eigen::MatrixXd design = finiteDifferenceDesignMatrix(observations,
+                                                                        vlbiObservations,
                                                                         integrator,
                                                                         dynamics,
                                                                         referenceEpoch,
@@ -1136,6 +1295,7 @@ int main() {
                 stats.weightedRms,
                 stats.rangeRmsKm,
                 stats.rangeRateRmsKmPerSec,
+                stats.vlbiRmsKm,
                 correction.segment<3>(0).norm(),
                 correction.segment<3>(3).norm(),
                 updatedError.segment<3>(0).norm(),
@@ -1150,12 +1310,14 @@ int main() {
 
         const State6 estimatedState = stateAtEpoch(filter);
         const Prediction postfitPrediction = predictObservations(observations,
+                                                                 vlbiObservations,
                                                                  integrator,
                                                                  dynamics,
                                                                  referenceEpoch,
                                                                  estimatedState);
         const od::EphemerisInterpolator estimatedEphemeris =
             propagateObservationEphemeris(observations,
+                                          vlbiObservations,
                                           integrator,
                                           dynamics,
                                           referenceEpoch,
@@ -1163,8 +1325,8 @@ int main() {
 
         const Eigen::VectorXd prefitResiduals = measured - prefitPrediction.values;
         const Eigen::VectorXd postfitResiduals = measured - postfitPrediction.values;
-        const ResidualStats prefitStats = computeStats(prefitResiduals, observations);
-        const ResidualStats postfitStats = computeStats(postfitResiduals, observations);
+        const ResidualStats prefitStats = computeStats(prefitResiduals, observations, vlbiObservations);
+        const ResidualStats postfitStats = computeStats(postfitResiduals, observations, vlbiObservations);
 
         const double priorPositionErrorKm = (priorState - truthState).segment<3>(0).norm();
         const double posteriorPositionErrorKm = (estimatedState - truthState).segment<3>(0).norm();
@@ -1172,6 +1334,7 @@ int main() {
         writeReport(kReportPath,
                     observationPath,
                     observations,
+                    vlbiObservations,
                     iterationRecords,
                     prefitPrediction,
                     postfitPrediction,
@@ -1204,7 +1367,8 @@ int main() {
 
         std::cout << std::scientific << std::setprecision(9)
                   << "Voyager multi-station OD from synthetic report\n"
-                  << "  observations                  : " << observations.size() << '\n'
+                  << "  station observations          : " << observations.size() << '\n'
+                  << "  VLBI observations             : " << vlbiObservations.size() << '\n'
                   << "  input report                  : " << observationPath.string() << '\n'
                   << "  output report                 : " << kReportPath << '\n'
                   << "  post-fit diagnostics CSV      : " << kPostfitDiagnosticsCsvPath << '\n'
@@ -1226,6 +1390,8 @@ int main() {
                   << " mm/s\n"
                   << "  post-fit range-rate RMS       : " << postfitStats.rangeRateRmsKmPerSec * 1.0e6
                   << " mm/s\n"
+                  << "  pre-fit VLBI RMS              : " << prefitStats.vlbiRmsKm * 1000.0 << " m\n"
+                  << "  post-fit VLBI RMS             : " << postfitStats.vlbiRmsKm * 1000.0 << " m\n"
                   << "  prior position error          : " << priorPositionErrorKm << " km\n"
                   << "  posterior position error      : " << posteriorPositionErrorKm << " km\n"
                   << "  posterior velocity error      : "
