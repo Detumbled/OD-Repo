@@ -63,6 +63,20 @@ void requireFiniteMatrix(const Eigen::MatrixXd& matrix, const char* label) {
     }
 }
 
+[[nodiscard]] bool isEffectivelyDiagonal(const Eigen::MatrixXd& matrix) {
+    constexpr double kAbsoluteTolerance = 1.0e-30;
+
+    for (Eigen::Index row = 0; row < matrix.rows(); ++row) {
+        for (Eigen::Index column = 0; column < matrix.cols(); ++column) {
+            if (row != column && std::abs(matrix(row, column)) > kAbsoluteTolerance) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 } // namespace
 
 WLS::WLS() = default;
@@ -80,12 +94,7 @@ void WLS::setInitialState(const Eigen::VectorXd& x0,
     Filter::setInitialState(x0, P0, epoch);
 
     prior_state_ = x0;
-    prior_covariance_ = P0;
-    prior_information_ = invertSymmetricPositiveDefinite(P0, "WLS prior covariance");
-
-    last_state_correction_.setZero(x0.size());
-    last_postfit_residuals_.resize(0);
-    last_information_matrix_.setZero(x0.size(), x0.size());
+    setApriori(P0);
 }
 
 void WLS::processBatch(const Eigen::VectorXd& residuals,
@@ -97,34 +106,169 @@ void WLS::processBatch(const Eigen::VectorXd& residuals,
 
     validateBatchInputs(residuals, designMatrix, measurementCovariance, x_hat_.size());
 
+    if (isEffectivelyDiagonal(measurementCovariance)) {
+        processBatchDiagonal(residuals, designMatrix, measurementCovariance.diagonal());
+        return;
+    }
+
+    Eigen::MatrixXd weighted_design;
+    Eigen::VectorXd weighted_residuals;
     // Apply the measurement weighting as solves instead of explicitly forming R^-1.
-    const Eigen::MatrixXd weighted_design = solveSymmetricPositiveDefinite(
+    weighted_design = solveSymmetricPositiveDefinite(
         measurementCovariance,
         designMatrix,
         "WLS measurement covariance");
-    const Eigen::VectorXd weighted_residuals = solveSymmetricPositiveDefinite(
+    weighted_residuals = solveSymmetricPositiveDefinite(
         measurementCovariance,
         residuals,
         "WLS measurement covariance");
 
+    applyWeightedNormalEquations(residuals, designMatrix, weighted_design, weighted_residuals);
+}
+
+void WLS::setApriori(const Eigen::MatrixXd& covariance) {
+    if (covariance.rows() == 0 || covariance.rows() != covariance.cols()) {
+        throw std::invalid_argument("WLS a-priori covariance must be non-empty and square.");
+    }
+    requireFiniteMatrix(covariance, "WLS a-priori covariance");
+    if (!covariance.isApprox(covariance.transpose(), 1.0e-12)) {
+        throw std::invalid_argument("WLS a-priori covariance must be symmetric.");
+    }
+
+    if (!initialized_) {
+        x_hat_.setZero(covariance.rows());
+        P_ = covariance;
+        prior_state_ = x_hat_;
+        epoch_tk_ = 0.0;
+        initialized_ = true;
+    } else {
+        if (covariance.rows() != x_hat_.size()) {
+            throw std::invalid_argument("WLS a-priori covariance dimensions must match the state dimension.");
+        }
+        P_ = covariance;
+        if (prior_state_.size() != x_hat_.size()) {
+            prior_state_ = x_hat_;
+        }
+    }
+
+    prior_covariance_ = covariance;
+    prior_information_ = invertSymmetricPositiveDefinite(covariance, "WLS prior covariance");
+
+    last_state_correction_.setZero(x_hat_.size());
+    last_postfit_residuals_.resize(0);
+    resetAccumulator();
+}
+
+void WLS::resetAccumulator() {
+    if (!initialized_) {
+        throw std::logic_error("WLS filter must be initialized before resetting the accumulator.");
+    }
+    if (prior_information_.rows() != x_hat_.size() || prior_information_.cols() != x_hat_.size()) {
+        throw std::logic_error("WLS a-priori information matrix is not initialized.");
+    }
+
+    information_matrix_ = prior_information_;
+    information_vector_ = prior_information_ * (prior_state_ - x_hat_);
+    accumulated_measurements_ = 0;
+    last_information_matrix_ = information_matrix_;
+}
+
+Eigen::VectorXd WLS::solve() const {
+    if (!initialized_) {
+        throw std::logic_error("WLS filter must be initialized before solving.");
+    }
+    if (information_matrix_.rows() != x_hat_.size()
+        || information_matrix_.cols() != x_hat_.size()
+        || information_vector_.size() != x_hat_.size()) {
+        throw std::logic_error("WLS information accumulator is not initialized.");
+    }
+
+    return solveSymmetricPositiveDefinite(
+        information_matrix_,
+        information_vector_,
+        "WLS normal information matrix");
+}
+
+Eigen::VectorXd WLS::solveAndUpdate() {
+    const Eigen::VectorXd correction = solve();
+
+    last_state_correction_ = correction;
+    last_information_matrix_ = information_matrix_;
+    x_hat_ += correction;
+    P_ = invertSymmetricPositiveDefinite(information_matrix_, "WLS normal information matrix");
+    last_postfit_residuals_.resize(0);
+    return correction;
+}
+
+std::size_t WLS::accumulatedMeasurementCount() const noexcept {
+    return accumulated_measurements_;
+}
+
+const Eigen::MatrixXd& WLS::informationMatrix() const noexcept {
+    return information_matrix_;
+}
+
+const Eigen::VectorXd& WLS::informationVector() const noexcept {
+    return information_vector_;
+}
+
+void WLS::processBatchDiagonal(const Eigen::VectorXd& residuals,
+                               const Eigen::MatrixXd& designMatrix,
+                               const Eigen::VectorXd& measurementVariances) {
+    if (!initialized_) {
+        throw std::logic_error("WLS filter must be initialized before processing a batch.");
+    }
+    if (residuals.size() == 0) {
+        throw std::invalid_argument("WLS residual vector cannot be empty.");
+    }
+    if (designMatrix.rows() != residuals.size() || designMatrix.cols() != x_hat_.size()) {
+        throw std::invalid_argument("WLS design matrix dimensions are inconsistent with residual/state dimensions.");
+    }
+    if (measurementVariances.size() != residuals.size()) {
+        throw std::invalid_argument("WLS measurement variance vector must match the residual dimension.");
+    }
+    if (!residuals.allFinite() || !measurementVariances.allFinite()) {
+        throw std::invalid_argument("WLS residuals and measurement variances must be finite.");
+    }
+
+    requireFiniteMatrix(designMatrix, "WLS design matrix");
+
+    for (Eigen::Index row = 0; row < measurementVariances.size(); ++row) {
+        const double variance = measurementVariances[row];
+        if (!(variance > 0.0) || !std::isfinite(variance)) {
+            throw std::invalid_argument("WLS measurement variances must be positive and finite.");
+        }
+    }
+
+    resetAccumulator();
+    for (Eigen::Index row = 0; row < residuals.size(); ++row) {
+        addMeasurementVariance(residuals[row], designMatrix.row(row), measurementVariances[row]);
+    }
+
+    const Eigen::VectorXd correction = solveAndUpdate();
+    last_postfit_residuals_ = residuals - designMatrix * correction;
+}
+
+void WLS::applyWeightedNormalEquations(const Eigen::VectorXd& residuals,
+                                       const Eigen::MatrixXd& designMatrix,
+                                       const Eigen::MatrixXd& weightedDesign,
+                                       const Eigen::VectorXd& weightedResiduals) {
     // Classical a-priori batch normal equations:
     // Lambda = H^T R^-1 H + P0^-1
     // N      = H^T R^-1 r + P0^-1 (x_prior - x_nominal)
     const Eigen::VectorXd prior_deviation = prior_state_ - x_hat_;
-    last_information_matrix_.noalias() = designMatrix.transpose() * weighted_design;
-    last_information_matrix_ += prior_information_;
+    information_matrix_.noalias() = designMatrix.transpose() * weightedDesign;
+    information_matrix_ += prior_information_;
 
     Eigen::VectorXd normal_rhs(x_hat_.size());
-    normal_rhs.noalias() = designMatrix.transpose() * weighted_residuals;
+    normal_rhs.noalias() = designMatrix.transpose() * weightedResiduals;
     normal_rhs += prior_information_ * prior_deviation;
+    information_vector_ = normal_rhs;
+    accumulated_measurements_ = static_cast<std::size_t>(residuals.size());
+    last_information_matrix_ = information_matrix_;
 
-    last_state_correction_ = solveSymmetricPositiveDefinite(
-        last_information_matrix_,
-        normal_rhs,
-        "WLS normal information matrix");
+    last_state_correction_ = solveAndUpdate();
 
-    x_hat_ += last_state_correction_;
-    P_ = invertSymmetricPositiveDefinite(last_information_matrix_, "WLS normal information matrix");
     last_postfit_residuals_ = residuals - designMatrix * last_state_correction_;
 }
 

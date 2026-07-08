@@ -268,11 +268,18 @@ double SyntheticObservation::shapiroRangeDelayFor(const std::string& target,
 }
 
 double SyntheticObservation::drawNoise() {
-    if (!noise_.enabled || noise_.sigma == 0.0) {
+    return drawNoise(noise_.sigma);
+}
+
+double SyntheticObservation::drawNoise(double sigma) {
+    if (!std::isfinite(sigma) || sigma < 0.0) {
+        throw std::invalid_argument("Synthetic observation noise sigma must be finite and non-negative.");
+    }
+    if (!noise_.enabled || sigma == 0.0) {
         return 0.0;
     }
 
-    std::normal_distribution<double> distribution(0.0, noise_.sigma);
+    std::normal_distribution<double> distribution(0.0, sigma);
     return distribution(rng_);
 }
 

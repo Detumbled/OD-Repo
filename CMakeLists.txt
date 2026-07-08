@@ -124,8 +124,10 @@ set(BIG_FUNCTIONS_SOURCE_CANDIDATES
     src/stations/ElevationMask.cpp
     src/RKF45Integrator.cpp
     src/dynamics/EphemerisInterpolator.cpp
+    src/dynamics/SpiceInterpolator.cpp
     src/filters/filter.cpp
     src/filters/WLS.cpp
+    src/filters/BatchLeastSquaresDriver.cpp
     src/observations/synth/obs_synth.cpp
     src/observations/synth/RangeSynth.cpp
     src/observations/synth/RangeRateSynth.cpp

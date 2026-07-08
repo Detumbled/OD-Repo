@@ -210,9 +210,12 @@ Shared features:
 
 `RangeRateSynth`:
 
-- Computes geometric one-way range-rate from relative position/velocity.
-- Adds a finite-difference derivative of solar Shapiro delay using `dt = 1 s`.
-- Adds optional Gaussian range-rate noise.
+- Computes one-way range-rate as centered differenced range over a configurable
+  count time, defaulting to 60 s.
+- Includes solar Shapiro delay in both endpoint ranges, so the differenced
+  observable naturally includes the Shapiro rate.
+- Adds optional Gaussian range-rate noise with sigma scaled by
+  `1 / sqrt(count_time_s)`.
 
 `VLBISynth`:
 
@@ -229,13 +232,17 @@ generates elevation-filtered station and VLBI observations:
 - Stations: DSS-43, DSS-63
 - Target: Voyager 1 (`-31`), initial state seeded at arc start
 - Start: `1979-01-10T00:00:00`
-- Duration: 2 days
+- Duration: 4 days
 - Elevation mask: 10 degrees
 - Cadence: 3 minutes
-- Samples after mask: 828 total; DSS-43 330, DSS-63 498
-- VLBI samples after dual-station visibility mask: 5
+- VLBI cadence: 20 seconds
+- Samples after mask: 1655 total; DSS-43 659, DSS-63 996
+- VLBI samples after dual-station visibility mask: 2902 total; DSS-43/DSS-63
+  82, DSS-14/DSS-43 2820
 - Range sigma: 0.010 km
-- Range-rate sigma: `1.0e-6 km/s`
+- Range-rate base sigma: `1.0e-6 km/s` at 1 s
+- Range-rate count time: 60 s
+- Range-rate row sigma: `1.290994e-7 km/s`
 - VLBI sigma: 0.001 km
 
 The output report keeps the historical filename but now includes a `station`
@@ -307,9 +314,10 @@ This file is useful for inspecting synthetic observation values and for checking
 whether light-time, Shapiro, noise, or elevation-mask settings changed output.
 
 `test_voyager_position_od` consumes that report and estimates the Voyager 1
-initial state using the same RKF45 truth dynamics as the synthetic generator:
+initial state using DP853 propagation with cached SPICE body/station states:
 Sun gravity, Jupiter body `599`, Galilean moons `501-504`, Saturn barycenter
-`6`, SRP, light-time, and Shapiro delay. It writes:
+`6`, SRP, light-time, Shapiro delay, centered count-time range-rate, and VLBI
+differential range. It writes:
 
 ```text
 tests/voyager_position_estimation_report.txt
@@ -330,10 +338,12 @@ Latest verified `jup310.bsp` run:
 ```text
 Active third bodies: 599 501 502 503 504 6
 Prior position error:      70.710678 km
-Posterior position error:  42.261878 km
-Range RMS:                 99187.418 m -> 9.596 m
-Range-rate RMS:            529.418 mm/s -> 1.018 mm/s
-VLBI RMS:                  1.643 m -> 1.079 m
+Posterior position error:  5.766723 km
+Solver status:             CONVERGED in 5 iterations
+Solver weighted RMS:       0.694371
+Range RMS:                 150770.580 m -> 9.671 m
+Range-rate RMS:            528.089 mm/s -> 0.179 mm/s
+VLBI RMS:                  1.598 m -> 1.005 m
 ```
 
 This is a diagnostic OD test, not a final high-precision solution. The longer

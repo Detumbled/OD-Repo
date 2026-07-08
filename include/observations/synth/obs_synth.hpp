@@ -71,6 +71,7 @@ protected:
                                               const std::string& stationName,
                                               const RelativeGeometry& geometry) const;
     [[nodiscard]] double drawNoise();
+    [[nodiscard]] double drawNoise(double sigma);
 
     GeometryConfig geometry_;
     NoiseConfig noise_;

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -31,9 +32,19 @@ namespace {
 
 using State6 = Eigen::Matrix<double, 6, 1>;
 
+struct VLBIBaselineConfig {
+    const char* stationOneName;
+    const char* stationTwoName;
+    std::uint32_t noiseSeed;
+};
+
 constexpr const char* kMetaKernel = "../kernels.tm";
 constexpr const char* kStartUtc = "1979-01-10T00:00:00";
 constexpr std::array<const char*, 2> kStationNames {"DSS-43", "DSS-63"};
+constexpr std::array<VLBIBaselineConfig, 2> kVLBIBaselines {{
+    {"DSS-43", "DSS-63", 5301U},
+    {"DSS-14", "DSS-43", 5401U}
+}};
 constexpr const char* kTarget = "-31";
 constexpr const char* kCentralBody = "SUN";
 constexpr const char* kFrame = "J2000";
@@ -45,6 +56,8 @@ constexpr const char* kCallisto = "504";
 constexpr const char* kSaturnBarycenter = "6";
 constexpr double kArcDurationSec = 2 * 48.0 * 3600.0;
 constexpr double kCadenceSec = 180.0;
+constexpr double kVLBICadenceSec = 20.0;
+constexpr std::size_t kMinVLBISamplesPerBaseline = 20;
 constexpr double kElevationMaskDeg = 10.0;
 constexpr double kRangeSigmaKm = 0.010;
 constexpr double kRangeRateSigmaKmPerSec = 1.0e-6;
@@ -61,7 +74,7 @@ constexpr double kVoyagerAreaM2 = 10.0;
 constexpr double kVoyagerMassKg = 721.9;
 constexpr double kLightTimeToleranceSec = 1.0e-9;
 constexpr int kMaxLightTimeIterations = 12;
-constexpr double kRangeRateStepSec = 1.0;
+constexpr double kRangeRateCountTimeSec = 60.0;
 constexpr double kSyntheticEphemerisLookbackSec = 3.0 * 3600.0;
 constexpr const char* kReportPath = "../synthetic_observations_dss43_voyager1.txt";
 
@@ -79,6 +92,11 @@ struct VLBIObservationSet {
     std::string stationOneNaif;
     std::string stationTwoNaif;
     std::vector<fd::observations::synth::SyntheticObservationSample> delays;
+};
+
+struct StationInfo {
+    od::Station station;
+    std::string stationNaif;
 };
 
 struct ReportRow {
@@ -332,6 +350,18 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
     return station_two_range.rangeKm - station_one_range.rangeKm;
 }
 
+[[nodiscard]] double computeRangeRateAtReceiveEpoch(const od::EphemerisInterpolator& spacecraftEphemeris,
+                                                    const std::string& stationNaif,
+                                                    double receiveEpoch,
+                                                    double countTimeSec) {
+    const double half_count_time = 0.5 * countTimeSec;
+    const ComputedRange start_range =
+        computeRangeAtReceiveEpoch(spacecraftEphemeris, stationNaif, receiveEpoch - half_count_time);
+    const ComputedRange end_range =
+        computeRangeAtReceiveEpoch(spacecraftEphemeris, stationNaif, receiveEpoch + half_count_time);
+    return (end_range.rangeKm - start_range.rangeKm) / countTimeSec;
+}
+
 [[nodiscard]] Eigen::Vector3d rotateJ2000ToItrf93(const Eigen::Vector3d& vector,
                                                   double epochTdb) {
     SpiceDouble rotation[3][3] = {};
@@ -383,11 +413,80 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
     return distribution(rng);
 }
 
+[[nodiscard]] double rangeRateSigmaForCountTime() {
+    return kRangeRateSigmaKmPerSec / std::sqrt(kRangeRateCountTimeSec);
+}
+
 [[nodiscard]] std::string utcFromEt(double et) {
     SpiceChar utc[128] = {0};
     et2utc_c(et, "ISOC", 3, static_cast<SpiceInt>(sizeof(utc)), utc);
     throwIfSpiceFailed("Failed to convert ET to UTC");
     return utc;
+}
+
+[[nodiscard]] StationInfo stationInfoForName(const std::string& stationName, double epochTdb) {
+    const int station_naif_id = od::stationNaifIdFromName(stationName);
+    return StationInfo{
+        od::buildStationFromKernel(stationName, station_naif_id, epochTdb),
+        std::to_string(station_naif_id)
+    };
+}
+
+[[nodiscard]] VLBIObservationSet generateVlbiObservationSet(
+    const VLBIBaselineConfig& baseline,
+    const od::EphemerisInterpolator& truthEphemeris,
+    const std::vector<double>& epochs,
+    double stationGeometryEpoch) {
+    const StationInfo station_one = stationInfoForName(baseline.stationOneName, stationGeometryEpoch);
+    const StationInfo station_two = stationInfoForName(baseline.stationTwoName, stationGeometryEpoch);
+
+    std::mt19937 vlbi_rng(baseline.noiseSeed);
+    VLBIObservationSet vlbi_set;
+    vlbi_set.stationOneName = station_one.station.name();
+    vlbi_set.stationTwoName = station_two.station.name();
+    vlbi_set.stationOneNaif = station_one.stationNaif;
+    vlbi_set.stationTwoNaif = station_two.stationNaif;
+
+    vlbi_set.delays.reserve(epochs.size());
+    for (const double epoch : epochs) {
+        const bool first_visible =
+            computePropagatedElevationDeg(truthEphemeris,
+                                          station_one.station,
+                                          station_one.stationNaif,
+                                          epoch) >= kElevationMaskDeg;
+        const bool second_visible =
+            computePropagatedElevationDeg(truthEphemeris,
+                                          station_two.station,
+                                          station_two.stationNaif,
+                                          epoch) >= kElevationMaskDeg;
+        if (!first_visible || !second_visible) {
+            continue;
+        }
+
+        const double truth = computeVlbiDelayAtReceiveEpoch(truthEphemeris,
+                                                            vlbi_set.stationOneNaif,
+                                                            vlbi_set.stationTwoNaif,
+                                                            epoch);
+        const double noise = drawGaussian(vlbi_rng, kVLBISigmaKm);
+        vlbi_set.delays.push_back(fd::observations::synth::SyntheticObservationSample{
+            epoch,
+            truth,
+            noise,
+            truth + noise,
+            kVLBISigmaKm
+        });
+    }
+
+    if (vlbi_set.delays.size() < kMinVLBISamplesPerBaseline) {
+        std::ostringstream message;
+        message << "Elevation mask produced only " << vlbi_set.delays.size()
+                << " synthetic VLBI observations for "
+                << vlbi_set.stationOneName << '/' << vlbi_set.stationTwoName
+                << "; need at least " << kMinVLBISamplesPerBaseline << '.';
+        throw std::runtime_error(message.str());
+    }
+
+    return vlbi_set;
 }
 
 [[nodiscard]] std::vector<ReportRow> makeSortedReportRows(
@@ -466,9 +565,13 @@ void writeReport(
            << "# relativistic_delay    : Solar Shapiro range delay applied\n"
            << "# elevation_mask_deg    : " << kElevationMaskDeg << '\n'
            << "# range_sigma_km        : " << kRangeSigmaKm << '\n'
-           << "# range_rate_sigma_km_s : " << kRangeRateSigmaKmPerSec << '\n'
+           << "# range_rate_base_sigma_1s_km_s : " << kRangeRateSigmaKmPerSec << '\n'
+           << "# range_rate_count_time_s : " << kRangeRateCountTimeSec << '\n'
+           << "# range_rate_sigma_km_s : " << rangeRateSigmaForCountTime() << '\n'
            << "# vlbi_sigma_km         : " << kVLBISigmaKm << '\n'
            << "# cadence_seconds       : " << kCadenceSec << '\n'
+           << "# vlbi_cadence_seconds  : " << kVLBICadenceSec << '\n'
+           << "# vlbi_min_samples_per_pair : " << kMinVLBISamplesPerBaseline << '\n'
            << "# vlbi_model            : differential one-way range, station2_minus_station1_km\n"
            << "# columns: utc station epoch_tdb range_truth_shapiro_km range_noise_km range_observed_km "
               "range_sigma_km range_rate_truth_shapiro_km_s range_rate_noise_km_s "
@@ -522,7 +625,7 @@ int main() {
 
         const double end_et = start_et + kArcDurationSec;
         const double ephemeris_start_et = start_et - kSyntheticEphemerisLookbackSec;
-        const double ephemeris_end_et = end_et + kRangeRateStepSec;
+        const double ephemeris_end_et = end_et + 0.5 * kRangeRateCountTimeSec;
 
         od::RKF45Integrator::Options options;
         options.absoluteTolerance = 1.0e-5;
@@ -596,15 +699,17 @@ int main() {
 
         const std::vector<double> epochs =
             fd::observations::synth::SyntheticObservation::makeEpochGrid(start_et, end_et, kCadenceSec);
+        const std::vector<double> vlbi_epochs =
+            fd::observations::synth::SyntheticObservation::makeEpochGrid(start_et,
+                                                                         end_et,
+                                                                         kVLBICadenceSec);
 
         std::vector<StationObservationSet> station_sets;
         station_sets.reserve(kStationNames.size());
 
         for (std::size_t station_index = 0; station_index < kStationNames.size(); ++station_index) {
             const std::string station_name = kStationNames[station_index];
-            const int station_naif_id = od::stationNaifIdFromName(station_name);
-            const std::string station_naif = std::to_string(station_naif_id);
-            od::Station station = od::buildStationFromKernel(station_name, station_naif_id, start_et);
+            StationInfo station_info = stationInfoForName(station_name, start_et);
 
             fd::observations::synth::GeometryConfig geometry;
             geometry.target = kTarget;
@@ -622,21 +727,21 @@ int main() {
 
             for (const double epoch : epochs) {
                 if (computePropagatedElevationDeg(truth_ephemeris,
-                                                  station,
-                                                  station_naif,
+                                                  station_info.station,
+                                                  station_info.stationNaif,
                                                   epoch) >= kElevationMaskDeg) {
                     const ComputedRange range =
-                        computeRangeAtReceiveEpoch(truth_ephemeris, station_naif, epoch);
-                    const ComputedRange next_range =
-                        computeRangeAtReceiveEpoch(truth_ephemeris,
-                                                   station_naif,
-                                                   epoch + kRangeRateStepSec);
+                        computeRangeAtReceiveEpoch(truth_ephemeris, station_info.stationNaif, epoch);
                     const double range_rate_truth =
-                        (next_range.rangeKm - range.rangeKm) / kRangeRateStepSec;
+                        computeRangeRateAtReceiveEpoch(truth_ephemeris,
+                                                       station_info.stationNaif,
+                                                       epoch,
+                                                       kRangeRateCountTimeSec);
+                    const double range_rate_sigma = rangeRateSigmaForCountTime();
 
                     const double range_noise = drawGaussian(range_rng, kRangeSigmaKm);
                     const double range_rate_noise =
-                        drawGaussian(range_rate_rng, kRangeRateSigmaKmPerSec);
+                        drawGaussian(range_rate_rng, range_rate_sigma);
 
                     valid_ranges.push_back(fd::observations::synth::SyntheticObservationSample{
                         epoch,
@@ -650,7 +755,7 @@ int main() {
                         range_rate_truth,
                         range_rate_noise,
                         range_rate_truth + range_rate_noise,
-                        kRangeRateSigmaKmPerSec
+                        range_rate_sigma
                     });
                 }
             }
@@ -660,67 +765,31 @@ int main() {
             }
 
             station_sets.push_back(StationObservationSet{
-                std::move(station),
-                station_naif,
+                std::move(station_info.station),
+                station_info.stationNaif,
                 std::move(geometry),
                 std::move(valid_ranges),
                 std::move(valid_rates)
             });
         }
 
-        if (station_sets.size() != 2U) {
-            throw std::runtime_error("VLBI synthetic generation currently expects exactly two stations.");
-        }
-
-        std::mt19937 vlbi_rng(5301U);
-        VLBIObservationSet vlbi_set;
-        vlbi_set.stationOneName = station_sets[0].station.name();
-        vlbi_set.stationTwoName = station_sets[1].station.name();
-        vlbi_set.stationOneNaif = station_sets[0].stationNaif;
-        vlbi_set.stationTwoNaif = station_sets[1].stationNaif;
-        vlbi_set.delays.reserve(epochs.size());
-
-        for (const double epoch : epochs) {
-            const bool first_visible =
-                computePropagatedElevationDeg(truth_ephemeris,
-                                              station_sets[0].station,
-                                              station_sets[0].stationNaif,
-                                              epoch) >= kElevationMaskDeg;
-            const bool second_visible =
-                computePropagatedElevationDeg(truth_ephemeris,
-                                              station_sets[1].station,
-                                              station_sets[1].stationNaif,
-                                              epoch) >= kElevationMaskDeg;
-            if (!first_visible || !second_visible) {
-                continue;
-            }
-
-            const double truth = computeVlbiDelayAtReceiveEpoch(truth_ephemeris,
-                                                                vlbi_set.stationOneNaif,
-                                                                vlbi_set.stationTwoNaif,
-                                                                epoch);
-            const double noise = drawGaussian(vlbi_rng, kVLBISigmaKm);
-            vlbi_set.delays.push_back(fd::observations::synth::SyntheticObservationSample{
-                epoch,
-                truth,
-                noise,
-                truth + noise,
-                kVLBISigmaKm
-            });
-        }
-
-        if (vlbi_set.delays.empty()) {
-            throw std::runtime_error("Elevation mask rejected every synthetic VLBI observation.");
-        }
-
         std::vector<VLBIObservationSet> vlbi_sets;
-        vlbi_sets.push_back(std::move(vlbi_set));
+        vlbi_sets.reserve(kVLBIBaselines.size());
+        for (const VLBIBaselineConfig& baseline : kVLBIBaselines) {
+            vlbi_sets.push_back(generateVlbiObservationSet(baseline,
+                                                           truth_ephemeris,
+                                                           vlbi_epochs,
+                                                           start_et));
+        }
 
         writeReport(kReportPath, station_sets, vlbi_sets);
 
         const std::vector<ReportRow> report_rows = makeSortedReportRows(station_sets);
         const std::size_t total_observation_count = report_rows.size();
-        const std::size_t total_vlbi_count = vlbi_sets.front().delays.size();
+        std::size_t total_vlbi_count = 0;
+        for (const VLBIObservationSet& vlbi_set : vlbi_sets) {
+            total_vlbi_count += vlbi_set.delays.size();
+        }
         const ReportRow& first_row = report_rows.front();
         const StationObservationSet& first_station_set = *first_row.stationSet;
         const double first_epoch = first_station_set.ranges[first_row.sampleIndex].epochTdb;
@@ -740,10 +809,11 @@ int main() {
         vlbi_config.minimumElevationRad = kElevationMaskDeg / dpr_c();
         fd::observations::synth::VLBISynth cspice_vlbi_synth(vlbi_config, no_noise);
         const auto cspice_range = cspice_range_synth.generate(first_epoch, first_epoch, kCadenceSec);
-        const auto cspice_rate = cspice_rate_synth.generate(first_epoch, first_epoch, kCadenceSec);
+        const auto cspice_rate =
+            cspice_rate_synth.generate(first_epoch, first_epoch, kCadenceSec, kRangeRateCountTimeSec);
         const auto cspice_vlbi = cspice_vlbi_synth.generate(first_vlbi_epoch,
                                                             first_vlbi_epoch,
-                                                            kCadenceSec);
+                                                            kVLBICadenceSec);
         if (cspice_range.size() != 1U || cspice_rate.size() != 1U || cspice_vlbi.size() != 1U) {
             throw std::runtime_error("Failed to generate one-sample CSPICE comparison observation.");
         }
@@ -751,12 +821,18 @@ int main() {
         std::cout << "Generated " << total_observation_count
                   << " visible DSS-43/DSS-63 Voyager 1 station observations in " << kReportPath << '\n'
                   << "Generated " << total_vlbi_count
-                  << " DSS-43/DSS-63 VLBI observations in " << kReportPath << '\n'
-                  << "First UTC: " << utcFromEt(report_rows.front().stationSet->ranges[report_rows.front().sampleIndex].epochTdb) << '\n'
+                  << " VLBI observations across " << vlbi_sets.size()
+                  << " baselines in " << kReportPath << '\n';
+        for (const VLBIObservationSet& vlbi_set : vlbi_sets) {
+            std::cout << "  " << vlbi_set.stationOneName << '/' << vlbi_set.stationTwoName
+                      << ": " << vlbi_set.delays.size() << " VLBI observations\n";
+        }
+        std::cout << "First UTC: " << utcFromEt(report_rows.front().stationSet->ranges[report_rows.front().sampleIndex].epochTdb) << '\n'
                   << "Last UTC : " << utcFromEt(report_rows.back().stationSet->ranges[report_rows.back().sampleIndex].epochTdb) << '\n'
                   << "Elevation mask: " << kElevationMaskDeg << " deg\n"
                   << "Range sigma: " << kRangeSigmaKm * 1000.0 << " m\n"
-                  << "Range-rate sigma: " << kRangeRateSigmaKmPerSec * 1000.0 << " m/s\n"
+                  << "Range-rate count time: " << kRangeRateCountTimeSec << " s\n"
+                  << "Range-rate sigma: " << rangeRateSigmaForCountTime() * 1000.0 << " m/s\n"
                   << "VLBI sigma: " << kVLBISigmaKm * 1000.0 << " m\n";
 
         std::cout << std::scientific << std::setprecision(12)

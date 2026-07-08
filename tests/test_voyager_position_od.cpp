@@ -1,33 +1,36 @@
 #include "stations/StationCatalog.hpp"
-#include "RKF45Integrator.hpp"
+#include "cspice_wrapper.hpp"
+#include "DP853Integrator.hpp"
 #include "dynamics/EphemerisInterpolator.hpp"
+#include "dynamics/SpiceInterpolator.hpp"
+#include "filters/BatchLeastSquaresDriver.hpp"
 #include "filters/WLS.hpp"
-#include "perturbations/Gravitational.hpp"
 #include "perturbations/SRP.hpp"
 #include "perturbations/Shapiro.hpp"
-
-#include <SpiceUsr.h>
 
 #include <Eigen/Dense>
 
 #include <algorithm>
-#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace {
 
 using State6 = Eigen::Matrix<double, 6, 1>;
+using od::throwIfSpiceFailed;
 
 constexpr const char* kMetaKernel = "../kernels.tm";
 constexpr const char* kTarget = "-31";
@@ -54,9 +57,12 @@ constexpr double kVoyagerAreaM2 = 10.0;
 constexpr double kVoyagerMassKg = 721.9;
 constexpr double kLightTimeToleranceSec = 1.0e-9;
 constexpr int kMaxLightTimeIterations = 12;
-constexpr double kRangeRateStepSec = 1.0;
+constexpr double kRangeRateCountTimeSec = 60.0;
 constexpr double kEphemerisLightTimePaddingSec = 600.0;
-constexpr int kMaxSolverIterations = 5;
+constexpr double kSpiceBodyInterpolationStepSec = 1800.0;
+constexpr double kSpiceStationInterpolationStepSec = 600.0;
+constexpr double kDp853InitialStepSec = 600.0;
+constexpr int kMaxSolverIterations = 50;
 constexpr double kAdoptedRangeSigmaFloorKm = 0.05; //50 meters
 constexpr double kAdoptedRangeRateSigmaFloorKmPerSec = 1.0e-4; //
 constexpr double kAdoptedVLBISigmaFloorKm = 0.001;
@@ -65,6 +71,8 @@ constexpr const char* kReportPath = "../tests/voyager_position_estimation_report
 constexpr const char* kPostfitDiagnosticsCsvPath = "../tests/voyager_od_postfit_diagnostics_VLBI.csv";
 constexpr const char* kTrajectoryErrorCsvPath = "../tests/voyager_od_trajectory_error_VLBI.csv";
 constexpr const char* kObservabilityWindowsCsvPath = "../tests/voyager_station_observability_windows_VLBI.csv";
+constexpr const char* kIterationResidualsCsvPath = "../tests/voyager_wls_iteration_residuals_VLBI.csv";
+constexpr const char* kIterationSummaryCsvPath = "../tests/voyager_wls_iteration_summary_VLBI.csv";
 
 struct Observation {
     std::string utc;
@@ -116,6 +124,19 @@ struct Prediction {
     std::vector<ComputedRange> vlbiStationTwoRanges;
 };
 
+struct MassiveBodyConfig {
+    std::string name;
+    double mu {0.0};
+};
+
+struct CachedThirdBody {
+    std::string name;
+    double mu {0.0};
+    od::SpiceInterpolator ephemeris;
+};
+
+using StationEphemerisMap = std::unordered_map<std::string, od::SpiceInterpolator>;
+
 struct ResidualStats {
     double rangeRmsKm {0.0};
     double rangeRateRmsKmPerSec {0.0};
@@ -135,41 +156,10 @@ struct IterationRecord {
     double velocityErrorKmPerSec {0.0};
 };
 
-class SpiceErrorModeGuard {
-public:
-    SpiceErrorModeGuard() {
-        erract_c("GET", static_cast<SpiceInt>(previousAction_.size()), previousAction_.data());
-        errprt_c("GET", static_cast<SpiceInt>(previousReport_.size()), previousReport_.data());
-        erract_c("SET", 0, const_cast<SpiceChar*>("RETURN"));
-        errprt_c("SET", 0, const_cast<SpiceChar*>("NONE"));
-    }
-
-    SpiceErrorModeGuard(const SpiceErrorModeGuard&) = delete;
-    SpiceErrorModeGuard& operator=(const SpiceErrorModeGuard&) = delete;
-
-    ~SpiceErrorModeGuard() {
-        erract_c("SET", 0, previousAction_.data());
-        errprt_c("SET", 0, previousReport_.data());
-    }
-
-private:
-    std::array<SpiceChar, 32> previousAction_ {};
-    std::array<SpiceChar, 32> previousReport_ {};
+struct IterationResidualSnapshot {
+    int iteration {0};
+    Eigen::VectorXd residuals;
 };
-
-void throwIfSpiceFailed(const std::string& context) {
-    if (!failed_c()) {
-        return;
-    }
-
-    SpiceChar shortMessage[1841] = {0};
-    SpiceChar longMessage[1841] = {0};
-    getmsg_c("SHORT", sizeof(shortMessage), shortMessage);
-    getmsg_c("LONG", sizeof(longMessage), longMessage);
-    reset_c();
-
-    throw std::runtime_error(context + ": " + shortMessage + " | " + longMessage);
-}
 
 [[nodiscard]] std::filesystem::path firstExistingPath(const std::vector<std::filesystem::path>& candidates,
                                                       const std::string& label) {
@@ -333,8 +323,8 @@ void throwIfSpiceFailed(const std::string& context) {
     return true;
 }
 
-void addThirdBodyIfCovered(fd::perturbations::ThirdBodyGravity& thirdBody,
-                           const fd::perturbations::MassiveBody& body,
+void addThirdBodyIfCovered(std::vector<CachedThirdBody>& thirdBodies,
+                           const MassiveBodyConfig& body,
                            double startEpoch,
                            double endEpoch,
                            bool required,
@@ -344,7 +334,15 @@ void addThirdBodyIfCovered(fd::perturbations::ThirdBodyGravity& thirdBody,
         && spiceStateAvailable(body.name, endEpoch, kCentralBody);
 
     if (hasCoverage) {
-        thirdBody.addBody(body);
+        od::SpiceInterpolator ephemeris;
+        ephemeris.initialize(body.name,
+                             kCentralBody,
+                             kFrame,
+                             startEpoch,
+                             endEpoch,
+                             kSpiceBodyInterpolationStepSec,
+                             "NONE");
+        thirdBodies.push_back(CachedThirdBody{body.name, body.mu, std::move(ephemeris)});
         activeBodies.push_back(body.name);
         return;
     }
@@ -357,12 +355,12 @@ void addThirdBodyIfCovered(fd::perturbations::ThirdBodyGravity& thirdBody,
 }
 
 void appendHistory(od::EphemerisInterpolator& ephemeris,
-                   const od::RKF45Integrator::Result& result) {
+                   const od::DP853Integrator::Result& result) {
     if (result.history.empty()) {
-        throw std::runtime_error("RKF45 propagation returned an empty ephemeris history.");
+        throw std::runtime_error("DP853 propagation returned an empty ephemeris history.");
     }
 
-    for (const od::RKF45Integrator::Result::EphemerisNode& node : result.history) {
+    for (const od::DP853Integrator::Result::EphemerisNode& node : result.history) {
         ephemeris.addNode(node.tdb, node.state, node.derivative);
     }
 }
@@ -378,14 +376,20 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
 }
 
 [[nodiscard]] od::EphemerisInterpolator propagateEphemeris(
-    const od::RKF45Integrator& integrator,
-    const od::RKF45Integrator::DerivativeFunction& dynamics,
+    const od::DP853Integrator& integrator,
+    const od::DP853Integrator::DynamicsFunction& dynamics,
     double referenceEpoch,
     const State6& referenceState,
     double finalEpoch) {
-    const od::RKF45Integrator::State dynamicInitial = referenceState;
-    const auto result = integrator.integrate(referenceEpoch, dynamicInitial, finalEpoch, dynamics);
-    (void) asState6(result.state, "Propagation");
+    double initialStep = kDp853InitialStepSec;
+    const auto result = integrator.integrateWithHistory(referenceEpoch,
+                                                        referenceState,
+                                                        finalEpoch,
+                                                        dynamics,
+                                                        initialStep);
+    if (!result.state.allFinite()) {
+        throw std::runtime_error("DP853 propagation produced an invalid Voyager state.");
+    }
 
     od::EphemerisInterpolator ephemeris;
     appendHistory(ephemeris, result);
@@ -393,8 +397,8 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
 }
 
 [[nodiscard]] od::EphemerisInterpolator propagateEphemerisSpan(
-    const od::RKF45Integrator& integrator,
-    const od::RKF45Integrator::DerivativeFunction& dynamics,
+    const od::DP853Integrator& integrator,
+    const od::DP853Integrator::DynamicsFunction& dynamics,
     double referenceEpoch,
     const State6& referenceState,
     double startEpoch,
@@ -407,17 +411,29 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
     bool addedSegment = false;
 
     if (startEpoch < referenceEpoch) {
-        const od::RKF45Integrator::State dynamicInitial = referenceState;
-        const auto backward = integrator.integrate(referenceEpoch, dynamicInitial, startEpoch, dynamics);
-        (void) asState6(backward.state, "Backward propagation");
+        double initialStep = kDp853InitialStepSec;
+        const auto backward = integrator.integrateWithHistory(referenceEpoch,
+                                                              referenceState,
+                                                              startEpoch,
+                                                              dynamics,
+                                                              initialStep);
+        if (!backward.state.allFinite()) {
+            throw std::runtime_error("DP853 backward propagation produced an invalid Voyager state.");
+        }
         appendHistory(ephemeris, backward);
         addedSegment = true;
     }
 
     if (finalEpoch > referenceEpoch) {
-        const od::RKF45Integrator::State dynamicInitial = referenceState;
-        const auto forward = integrator.integrate(referenceEpoch, dynamicInitial, finalEpoch, dynamics);
-        (void) asState6(forward.state, "Forward propagation");
+        double initialStep = kDp853InitialStepSec;
+        const auto forward = integrator.integrateWithHistory(referenceEpoch,
+                                                             referenceState,
+                                                             finalEpoch,
+                                                             dynamics,
+                                                             initialStep);
+        if (!forward.state.allFinite()) {
+            throw std::runtime_error("DP853 forward propagation produced an invalid Voyager state.");
+        }
         appendHistory(ephemeris, forward);
         addedSegment = true;
     }
@@ -435,12 +451,34 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
     return asState6(ephemeris.interpolate(tdb), context);
 }
 
-[[nodiscard]] od::RKF45Integrator::DerivativeFunction makeDynamics(
-    const fd::perturbations::ThirdBodyGravity& thirdBody,
+[[nodiscard]] Eigen::Vector3d cachedThirdBodyAcceleration(
+    const std::vector<CachedThirdBody>& thirdBodies,
+    double tdb,
+    const Eigen::Vector3d& spacecraftPosition) {
+    Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
+
+    for (const CachedThirdBody& body : thirdBodies) {
+        const Eigen::Vector3d centralToBody = body.ephemeris.getPosition(tdb);
+        const Eigen::Vector3d spacecraftToBody = centralToBody - spacecraftPosition;
+
+        const double bodyRadius = centralToBody.norm();
+        const double spacecraftBodyRadius = spacecraftToBody.norm();
+        if (bodyRadius <= 0.0 || spacecraftBodyRadius <= 0.0) {
+            throw std::runtime_error("Cached third-body geometry has a zero separation.");
+        }
+
+        acceleration += body.mu
+            * (spacecraftToBody / (spacecraftBodyRadius * spacecraftBodyRadius * spacecraftBodyRadius)
+               - centralToBody / (bodyRadius * bodyRadius * bodyRadius));
+    }
+
+    return acceleration;
+}
+
+[[nodiscard]] od::DP853Integrator::DynamicsFunction makeDynamics(
+    const std::vector<CachedThirdBody>& thirdBodies,
     const fd::perturbations::SolarRadiationPressure& srp) {
-    return [&thirdBody, &srp](double tdb,
-                              od::RKF45Integrator::ConstStateRef state,
-                              od::RKF45Integrator::StateRef derivative) {
+    return [&thirdBodies, &srp](double tdb, State6 state) {
         const Eigen::Vector3d position = state.segment<3>(0);
         const Eigen::Vector3d velocity = state.segment<3>(3);
         const double radius = position.norm();
@@ -448,11 +486,13 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
             throw std::runtime_error("Dynamics received zero Sun-spacecraft radius.");
         }
 
+        State6 derivative = State6::Zero();
         derivative.segment<3>(0) = velocity;
         derivative.segment<3>(3) =
             -kSunMuKm3PerSec2 * position / (radius * radius * radius)
-            + thirdBody.computeAcceleration(tdb, position)
+            + cachedThirdBodyAcceleration(thirdBodies, tdb, position)
             + srp.computeAcceleration(tdb, position);
+        return derivative;
     };
 }
 
@@ -500,17 +540,62 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
         lastEpoch = std::max(lastEpoch, observation.epochTdb);
     }
 
+    const double halfRangeRateCountTimeSec = 0.5 * kRangeRateCountTimeSec;
     const double lookbackSec = maximumObservedLightTimeSec(observations)
-        + kRangeRateStepSec
+        + halfRangeRateCountTimeSec
         + kEphemerisLightTimePaddingSec;
-    return {firstEpoch - lookbackSec, lastEpoch + kRangeRateStepSec};
+    return {firstEpoch - lookbackSec, lastEpoch + halfRangeRateCountTimeSec};
+}
+
+[[nodiscard]] std::vector<std::string> uniqueStationNaifs(
+    const std::vector<Observation>& observations,
+    const std::vector<VlbiObservation>& vlbiObservations) {
+    std::vector<std::string> stationNaifs;
+
+    const auto appendIfMissing = [&stationNaifs](const std::string& stationNaif) {
+        if (std::find(stationNaifs.begin(), stationNaifs.end(), stationNaif) == stationNaifs.end()) {
+            stationNaifs.push_back(stationNaif);
+        }
+    };
+
+    for (const Observation& observation : observations) {
+        appendIfMissing(observation.stationNaif);
+    }
+    for (const VlbiObservation& observation : vlbiObservations) {
+        appendIfMissing(observation.stationOneNaif);
+        appendIfMissing(observation.stationTwoNaif);
+    }
+
+    return stationNaifs;
+}
+
+[[nodiscard]] StationEphemerisMap initializeStationEphemerides(
+    const std::vector<Observation>& observations,
+    const std::vector<VlbiObservation>& vlbiObservations,
+    double startEpoch,
+    double finalEpoch) {
+    StationEphemerisMap stationEphemerides;
+
+    for (const std::string& stationNaif : uniqueStationNaifs(observations, vlbiObservations)) {
+        od::SpiceInterpolator ephemeris;
+        ephemeris.initialize(stationNaif,
+                             kCentralBody,
+                             kFrame,
+                             startEpoch,
+                             finalEpoch,
+                             kSpiceStationInterpolationStepSec,
+                             "NONE");
+        stationEphemerides.emplace(stationNaif, std::move(ephemeris));
+    }
+
+    return stationEphemerides;
 }
 
 [[nodiscard]] od::EphemerisInterpolator propagateObservationEphemeris(
     const std::vector<Observation>& observations,
     const std::vector<VlbiObservation>& vlbiObservations,
-    const od::RKF45Integrator& integrator,
-    const od::RKF45Integrator::DerivativeFunction& dynamics,
+    const od::DP853Integrator& integrator,
+    const od::DP853Integrator::DynamicsFunction& dynamics,
     double referenceEpoch,
     const State6& referenceState) {
     const auto [startEpoch, finalEpoch] = ephemerisBoundsForObservations(observations, vlbiObservations);
@@ -523,9 +608,15 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
 }
 
 [[nodiscard]] ComputedRange computeRangeAtReceiveEpoch(const od::EphemerisInterpolator& spacecraftEphemeris,
+                                                       const StationEphemerisMap& stationEphemerides,
                                                        const std::string& stationNaif,
                                                        double receiveEpoch) {
-    const State6 stationState = spiceState(stationNaif, receiveEpoch, kCentralBody, "NONE");
+    const auto station = stationEphemerides.find(stationNaif);
+    if (station == stationEphemerides.end()) {
+        throw std::runtime_error("Missing cached station ephemeris for station " + stationNaif);
+    }
+
+    const State6 stationState = station->second.getState(receiveEpoch);
     const Eigen::Vector3d stationPosition = stationState.segment<3>(0);
 
     double lightTimeSec = 0.0;
@@ -566,8 +657,9 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
 
 [[nodiscard]] Prediction predictObservations(const std::vector<Observation>& observations,
                                              const std::vector<VlbiObservation>& vlbiObservations,
-                                             const od::RKF45Integrator& integrator,
-                                             const od::RKF45Integrator::DerivativeFunction& dynamics,
+                                             const StationEphemerisMap& stationEphemerides,
+                                             const od::DP853Integrator& integrator,
+                                             const od::DP853Integrator::DynamicsFunction& dynamics,
                                              double referenceEpoch,
                                              const State6& referenceState) {
     const od::EphemerisInterpolator spacecraftEphemeris =
@@ -585,17 +677,25 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
     prediction.vlbiStationTwoRanges.reserve(vlbiObservations.size());
 
     for (std::size_t i = 0; i < observations.size(); ++i) {
+        const double halfRangeRateCountTimeSec = 0.5 * kRangeRateCountTimeSec;
         const ComputedRange range = computeRangeAtReceiveEpoch(spacecraftEphemeris,
+                                                               stationEphemerides,
                                                                observations[i].stationNaif,
                                                                observations[i].epochTdb);
-        const ComputedRange nextRange = computeRangeAtReceiveEpoch(spacecraftEphemeris,
-                                                                   observations[i].stationNaif,
-                                                                   observations[i].epochTdb
-                                                                       + kRangeRateStepSec);
+        const ComputedRange rangeRateStart = computeRangeAtReceiveEpoch(
+            spacecraftEphemeris,
+            stationEphemerides,
+            observations[i].stationNaif,
+            observations[i].epochTdb - halfRangeRateCountTimeSec);
+        const ComputedRange rangeRateEnd = computeRangeAtReceiveEpoch(
+            spacecraftEphemeris,
+            stationEphemerides,
+            observations[i].stationNaif,
+            observations[i].epochTdb + halfRangeRateCountTimeSec);
 
         prediction.values[static_cast<Eigen::Index>(2 * i)] = range.rangeKm;
         prediction.values[static_cast<Eigen::Index>(2 * i + 1)] =
-            (nextRange.rangeKm - range.rangeKm) / kRangeRateStepSec;
+            (rangeRateEnd.rangeKm - rangeRateStart.rangeKm) / kRangeRateCountTimeSec;
         prediction.ranges.push_back(range);
     }
 
@@ -604,10 +704,12 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
         const VlbiObservation& observation = vlbiObservations[i];
         const ComputedRange stationOneRange =
             computeRangeAtReceiveEpoch(spacecraftEphemeris,
+                                       stationEphemerides,
                                        observation.stationOneNaif,
                                        observation.epochTdb);
         const ComputedRange stationTwoRange =
             computeRangeAtReceiveEpoch(spacecraftEphemeris,
+                                       stationEphemerides,
                                        observation.stationTwoNaif,
                                        observation.epochTdb);
 
@@ -634,43 +736,45 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
     return measured;
 }
 
-[[nodiscard]] Eigen::MatrixXd measurementCovariance(const std::vector<Observation>& observations,
-                                                    const std::vector<VlbiObservation>& vlbiObservations) {
+[[nodiscard]] Eigen::VectorXd measurementVariances(const std::vector<Observation>& observations,
+                                                   const std::vector<VlbiObservation>& vlbiObservations) {
     const Eigen::Index count = measurementCount(observations, vlbiObservations);
-    Eigen::MatrixXd covariance = Eigen::MatrixXd::Zero(count, count);
+    Eigen::VectorXd variances(count);
     for (std::size_t i = 0; i < observations.size(); ++i) {
         const double adoptedRangeSigmaKm = std::max(observations[i].rangeSigmaKm,
                                                     kAdoptedRangeSigmaFloorKm);
         const double adoptedRangeRateSigmaKmPerSec = std::max(observations[i].rangeRateSigmaKmPerSec,
                                                               kAdoptedRangeRateSigmaFloorKmPerSec);
 
-        covariance(static_cast<Eigen::Index>(2 * i), static_cast<Eigen::Index>(2 * i)) =
+        variances[static_cast<Eigen::Index>(2 * i)] =
             adoptedRangeSigmaKm * adoptedRangeSigmaKm;
-        covariance(static_cast<Eigen::Index>(2 * i + 1), static_cast<Eigen::Index>(2 * i + 1)) =
+        variances[static_cast<Eigen::Index>(2 * i + 1)] =
             adoptedRangeRateSigmaKmPerSec * adoptedRangeRateSigmaKmPerSec;
     }
     const Eigen::Index vlbiOffset = static_cast<Eigen::Index>(2 * observations.size());
     for (std::size_t i = 0; i < vlbiObservations.size(); ++i) {
         const double adoptedVLBISigmaKm = std::max(vlbiObservations[i].delaySigmaKm,
                                                    kAdoptedVLBISigmaFloorKm);
-        covariance(vlbiOffset + static_cast<Eigen::Index>(i),
-                   vlbiOffset + static_cast<Eigen::Index>(i)) =
+        variances[vlbiOffset + static_cast<Eigen::Index>(i)] =
             adoptedVLBISigmaKm * adoptedVLBISigmaKm;
     }
-    return covariance;
+    return variances;
 }
 
 [[nodiscard]] Eigen::MatrixXd finiteDifferenceDesignMatrix(
     const std::vector<Observation>& observations,
     const std::vector<VlbiObservation>& vlbiObservations,
-    const od::RKF45Integrator& integrator,
-    const od::RKF45Integrator::DerivativeFunction& dynamics,
+    const StationEphemerisMap& stationEphemerides,
+    const od::DP853Integrator& integrator,
+    const od::DP853Integrator::DynamicsFunction& dynamics,
     double referenceEpoch,
     const State6& nominalState) {
     Eigen::Matrix<double, 6, 1> perturbationSteps;
     perturbationSteps << 1.0, 1.0, 1.0, 1.0e-4, 1.0e-4, 1.0e-4;
 
     Eigen::MatrixXd design(measurementCount(observations, vlbiObservations), 6);
+    std::vector<std::future<std::pair<Eigen::Index, Eigen::VectorXd>>> futures;
+    futures.reserve(6);
 
     for (Eigen::Index column = 0; column < 6; ++column) {
         State6 plusState = nominalState;
@@ -678,22 +782,34 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
         plusState[column] += perturbationSteps[column];
         minusState[column] -= perturbationSteps[column];
 
-        const Eigen::VectorXd plus =
-            predictObservations(observations,
-                                vlbiObservations,
-                                integrator,
-                                dynamics,
-                                referenceEpoch,
-                                plusState).values;
-        const Eigen::VectorXd minus =
-            predictObservations(observations,
-                                vlbiObservations,
-                                integrator,
-                                dynamics,
-                                referenceEpoch,
-                                minusState).values;
+        futures.push_back(std::async(std::launch::async,
+                                     [&, column, plusState, minusState]() {
+                                         const Eigen::VectorXd plus =
+                                             predictObservations(observations,
+                                                                 vlbiObservations,
+                                                                 stationEphemerides,
+                                                                 integrator,
+                                                                 dynamics,
+                                                                 referenceEpoch,
+                                                                 plusState).values;
+                                         const Eigen::VectorXd minus =
+                                             predictObservations(observations,
+                                                                 vlbiObservations,
+                                                                 stationEphemerides,
+                                                                 integrator,
+                                                                 dynamics,
+                                                                 referenceEpoch,
+                                                                 minusState).values;
 
-        design.col(column) = (plus - minus) / (2.0 * perturbationSteps[column]);
+                                         Eigen::VectorXd partials =
+                                             (plus - minus) / (2.0 * perturbationSteps[column]);
+                                         return std::make_pair(column, std::move(partials));
+                                     }));
+    }
+
+    for (auto& future : futures) {
+        const auto [column, partials] = future.get();
+        design.col(column) = partials;
     }
 
     if (!design.allFinite()) {
@@ -860,6 +976,120 @@ void writePostfitDiagnosticsCsv(const std::filesystem::path& path,
     }
 }
 
+void writeIterationSummaryCsv(const std::filesystem::path& path,
+                              const std::vector<IterationRecord>& iterations) {
+    std::ofstream csv(path);
+    if (!csv) {
+        throw std::runtime_error("Failed to open WLS iteration summary CSV: " + path.string());
+    }
+
+    csv << std::scientific << std::setprecision(12);
+    csv << "iteration,weighted_rms,range_rms_m,range_rate_rms_mm_s,vlbi_rms_m,"
+           "correction_position_norm_m,correction_velocity_norm_mm_s,"
+           "position_error_norm_km,velocity_error_norm_km_s,"
+           "position_error_rms_km,velocity_error_rms_mm_s\n";
+
+    constexpr double kInvSqrt3 = 1.0 / 1.7320508075688772935;
+    for (const IterationRecord& record : iterations) {
+        csv << record.iteration << ','
+            << record.weightedRms << ','
+            << record.rangeRmsKm * 1000.0 << ','
+            << record.rangeRateRmsKmPerSec * 1.0e6 << ','
+            << record.vlbiRmsKm * 1000.0 << ','
+            << record.correctionPositionNormKm * 1000.0 << ','
+            << record.correctionVelocityNormKmPerSec * 1.0e6 << ','
+            << record.positionErrorKm << ','
+            << record.velocityErrorKmPerSec << ','
+            << record.positionErrorKm * kInvSqrt3 << ','
+            << record.velocityErrorKmPerSec * 1.0e6 * kInvSqrt3 << '\n';
+    }
+}
+
+void writeIterationResidualsCsv(const std::filesystem::path& path,
+                                const std::vector<Observation>& observations,
+                                const std::vector<VlbiObservation>& vlbiObservations,
+                                const std::vector<IterationResidualSnapshot>& residualSnapshots,
+                                double referenceEpoch) {
+    std::ofstream csv(path);
+    if (!csv) {
+        throw std::runtime_error("Failed to open WLS iteration residual CSV: " + path.string());
+    }
+
+    csv << std::scientific << std::setprecision(12);
+    csv << "iteration,measurement_type,measurement_index,sample_index,utc,station_label,"
+           "station_one,station_two,epoch_tdb,dt_since_reference_s,"
+           "residual_plot_value,sigma_plot_value,normalized_residual,plot_unit\n";
+
+    const Eigen::Index expectedCount = measurementCount(observations, vlbiObservations);
+    for (const IterationResidualSnapshot& snapshot : residualSnapshots) {
+        if (snapshot.residuals.size() != expectedCount) {
+            throw std::runtime_error("WLS iteration residual vector has inconsistent size.");
+        }
+
+        for (std::size_t i = 0; i < observations.size(); ++i) {
+            const Observation& observation = observations[i];
+            const Eigen::Index rangeRow = static_cast<Eigen::Index>(2 * i);
+            const Eigen::Index rangeRateRow = static_cast<Eigen::Index>(2 * i + 1);
+
+            const double rangeResidualM = snapshot.residuals[rangeRow] * 1000.0;
+            const double rangeSigmaM = observation.rangeSigmaKm * 1000.0;
+            csv << snapshot.iteration << ','
+                << "range" << ','
+                << rangeRow << ','
+                << i << ','
+                << observation.utc << ','
+                << observation.stationName << ','
+                << observation.stationName << ','
+                << "" << ','
+                << observation.epochTdb << ','
+                << observation.epochTdb - referenceEpoch << ','
+                << rangeResidualM << ','
+                << rangeSigmaM << ','
+                << rangeResidualM / rangeSigmaM << ','
+                << "m\n";
+
+            const double rangeRateResidualMmPerSec = snapshot.residuals[rangeRateRow] * 1.0e6;
+            const double rangeRateSigmaMmPerSec = observation.rangeRateSigmaKmPerSec * 1.0e6;
+            csv << snapshot.iteration << ','
+                << "range_rate" << ','
+                << rangeRateRow << ','
+                << i << ','
+                << observation.utc << ','
+                << observation.stationName << ','
+                << observation.stationName << ','
+                << "" << ','
+                << observation.epochTdb << ','
+                << observation.epochTdb - referenceEpoch << ','
+                << rangeRateResidualMmPerSec << ','
+                << rangeRateSigmaMmPerSec << ','
+                << rangeRateResidualMmPerSec / rangeRateSigmaMmPerSec << ','
+                << "mm/s\n";
+        }
+
+        const Eigen::Index vlbiOffset = static_cast<Eigen::Index>(2 * observations.size());
+        for (std::size_t i = 0; i < vlbiObservations.size(); ++i) {
+            const VlbiObservation& observation = vlbiObservations[i];
+            const Eigen::Index row = vlbiOffset + static_cast<Eigen::Index>(i);
+            const double vlbiResidualM = snapshot.residuals[row] * 1000.0;
+            const double vlbiSigmaM = observation.delaySigmaKm * 1000.0;
+            csv << snapshot.iteration << ','
+                << "vlbi" << ','
+                << row << ','
+                << i << ','
+                << observation.utc << ','
+                << observation.stationOneName << '/' << observation.stationTwoName << ','
+                << observation.stationOneName << ','
+                << observation.stationTwoName << ','
+                << observation.epochTdb << ','
+                << observation.epochTdb - referenceEpoch << ','
+                << vlbiResidualM << ','
+                << vlbiSigmaM << ','
+                << vlbiResidualM / vlbiSigmaM << ','
+                << "m\n";
+        }
+    }
+}
+
 void writeTrajectoryErrorCsv(const std::filesystem::path& path,
                              const std::vector<Observation>& observations,
                              const od::EphemerisInterpolator& truthEphemeris,
@@ -983,6 +1213,8 @@ void writeReport(const std::filesystem::path& path,
                  const std::vector<Observation>& observations,
                  const std::vector<VlbiObservation>& vlbiObservations,
                  const std::vector<IterationRecord>& iterations,
+                 const fd::filters::BatchLeastSquaresDriver::Result& solverResult,
+                 const fd::filters::BatchLeastSquaresDriver::ConvergenceCriteria& solverCriteria,
                  const Prediction& prefitPrediction,
                  const Prediction& postfitPrediction,
                  const State6& truthState,
@@ -992,7 +1224,7 @@ void writeReport(const std::filesystem::path& path,
                  const Eigen::MatrixXd& covariance,
                  const std::vector<std::string>& activeThirdBodies,
                  const std::vector<std::string>& skippedThirdBodies,
-                 const od::RKF45Integrator& integrator,
+                 const od::DP853Integrator& integrator,
                  const od::EphemerisInterpolator& estimatedEphemeris,
                  double referenceEpoch) {
     std::ofstream report(path);
@@ -1034,8 +1266,11 @@ void writeReport(const std::filesystem::path& path,
         report << ' ' << body;
     }
     report << '\n'
-           << "# truth_model: initial CSPICE Voyager state propagated with the same RKF45 dynamics used by OD\n"
-           << "# observation_model: Hermite-interpolated one-way light-time + solar Shapiro + finite-difference range-rate + station2-minus-station1 VLBI delay\n"
+           << "# truth_model: initial CSPICE Voyager state propagated with the same DP853 cached-SPICE dynamics used by OD\n"
+           << "# observation_model: Hermite-interpolated one-way light-time + solar Shapiro + centered count-time range-rate + station2-minus-station1 VLBI delay\n"
+           << "# range_rate_count_time_s: " << kRangeRateCountTimeSec << '\n'
+           << "# spice_body_interpolation_step_s: " << kSpiceBodyInterpolationStepSec << '\n'
+           << "# spice_station_interpolation_step_s: " << kSpiceStationInterpolationStepSec << '\n'
            << "# covariance_note: WLS uses sigma floors for simplified-dynamics model error; raw residuals below still use the input observations\n"
            << "# adopted_range_sigma_floor_km: " << kAdoptedRangeSigmaFloorKm << '\n'
            << "# adopted_range_rate_sigma_floor_km_s: " << kAdoptedRangeRateSigmaFloorKmPerSec << '\n'
@@ -1046,9 +1281,38 @@ void writeReport(const std::filesystem::path& path,
            << "# integrator_abs_tol: " << integrator.options().absoluteTolerance << '\n'
            << "# integrator_rel_tol: " << integrator.options().relativeTolerance << '\n'
            << "# integrator_max_step_s: " << integrator.options().maximumStep << '\n'
-           << "# prior_state_sun_j2000_km_km_s: " << priorState.transpose() << '\n'
+           << "# solver_status: " << solverResult.statusName() << '\n'
+           << "# solver_converged: " << (solverResult.converged() ? "true" : "false") << '\n'
+           << "# solver_iterations_completed: " << solverResult.iterationCount() << '\n'
+           << "# solver_max_iterations: " << solverCriteria.maxIterations << '\n'
+           << "# solver_minimum_iterations: " << solverCriteria.minimumIterations << '\n'
+           << "# solver_weighted_rms_tolerance: " << solverCriteria.weightedRmsTolerance << '\n'
+           << "# solver_linearized_postfit_weighted_rms_tolerance: "
+           << solverCriteria.linearizedPostfitWeightedRmsTolerance << '\n'
+           << "# solver_correction_norm_tolerance: " << solverCriteria.correctionNormTolerance << '\n'
+           << "# solver_weighted_rms_uses_adopted_sigma_floors: true\n"
+           << "# solver_convergence_blocks: offset size norm_tolerance\n";
+    for (const fd::filters::BatchLeastSquaresDriver::CorrectionBlockTolerance& block
+         : solverCriteria.correctionBlockTolerances) {
+        report << "# solver_convergence_block "
+               << block.offset << ' '
+               << block.size << ' '
+               << block.normTolerance << '\n';
+    }
+    if (solverResult.converged()) {
+        report << "# solver_converged_iterations: " << solverResult.iterationCount() << '\n';
+    }
+    if (!solverResult.iterations.empty()) {
+        const auto& finalSolverIteration = solverResult.iterations.back();
+        report << "# solver_final_weighted_rms: "
+               << finalSolverIteration.weightedRms << '\n'
+               << "# solver_final_linearized_postfit_weighted_rms: "
+               << finalSolverIteration.linearizedPostfitWeightedRms << '\n';
+    }
+
+    report << "# prior_state_sun_j2000_km_km_s: " << priorState.transpose() << '\n'
            << "# estimated_state_sun_j2000_km_km_s: " << estimatedState.transpose() << '\n'
-           << "# rkf45_truth_initial_state_sun_j2000_km_km_s: " << truthState.transpose() << '\n'
+           << "# dp853_truth_initial_state_sun_j2000_km_km_s: " << truthState.transpose() << '\n'
            << "# prior_position_error_km: " << priorError.segment<3>(0).norm() << '\n'
            << "# prior_velocity_error_km_s: " << priorError.segment<3>(3).norm() << '\n'
            << "# posterior_position_error_km: " << estimatedError.segment<3>(0).norm() << '\n'
@@ -1061,6 +1325,7 @@ void writeReport(const std::filesystem::path& path,
            << "# postfit_vlbi_rms_m: " << postfitStats.vlbiRmsKm * 1000.0 << '\n'
            << "# prefit_weighted_rms: " << prefitStats.weightedRms << '\n'
            << "# postfit_weighted_rms: " << postfitStats.weightedRms << '\n'
+           << "# residual_weighted_rms_uses_raw_observation_sigmas: true\n"
            << "# posterior_covariance_diag: " << covariance.diagonal().transpose() << '\n'
            << "# iterations: iteration weighted_rms range_rms_m range_rate_rms_mm_s vlbi_rms_m "
               "correction_pos_m correction_vel_mm_s position_error_km velocity_error_km_s\n";
@@ -1148,8 +1413,9 @@ void writeReport(const std::filesystem::path& path,
 } // namespace
 
 int main() {
+    const auto scriptStart = std::chrono::steady_clock::now();
     try {
-        const SpiceErrorModeGuard spiceErrorMode;
+        const od::SpiceErrorModeGuard spiceErrorMode;
 
         furnsh_c(kMetaKernel);
         throwIfSpiceFailed("Failed to load Voyager OD meta-kernel");
@@ -1178,57 +1444,61 @@ int main() {
                       truthState[4] - 4.0e-4,
                       truthState[5] + 2.0e-4;
 
-        od::RKF45Integrator::Options options;
+        od::DP853Integrator::Options options;
         options.absoluteTolerance = 1.0e-5;
         options.relativeTolerance = 1.0e-12;
-        options.initialStep = 30.0;
-        options.minimumStep = 1.0e-4;
-        options.maximumStep = 300.0;
+        options.minimumStep = 1.0e-3;
+        options.maximumStep = 7200.0;
         options.maximumSteps = 200000;
-        const od::RKF45Integrator integrator(options);
+        const od::DP853Integrator integrator(options);
 
-        fd::perturbations::ThirdBodyGravity thirdBody(kCentralBody, kFrame);
+        std::vector<CachedThirdBody> thirdBodies;
         std::vector<std::string> activeThirdBodies;
         std::vector<std::string> skippedThirdBodies;
         const auto [dynamicsStartEpoch, dynamicsFinalEpoch] =
             ephemerisBoundsForObservations(observations, vlbiObservations);
+        const StationEphemerisMap stationEphemerides =
+            initializeStationEphemerides(observations,
+                                         vlbiObservations,
+                                         dynamicsStartEpoch,
+                                         dynamicsFinalEpoch);
 
-        addThirdBodyIfCovered(thirdBody,
+        addThirdBodyIfCovered(thirdBodies,
                               {kJupiter, kJupiterBodyMuKm3PerSec2},
                               dynamicsStartEpoch,
                               dynamicsFinalEpoch,
                               true,
                               activeThirdBodies,
                               skippedThirdBodies);
-        addThirdBodyIfCovered(thirdBody,
+        addThirdBodyIfCovered(thirdBodies,
                               {kIo, kIoMuKm3PerSec2},
                               dynamicsStartEpoch,
                               dynamicsFinalEpoch,
                               false,
                               activeThirdBodies,
                               skippedThirdBodies);
-        addThirdBodyIfCovered(thirdBody,
+        addThirdBodyIfCovered(thirdBodies,
                               {kEuropa, kEuropaMuKm3PerSec2},
                               dynamicsStartEpoch,
                               dynamicsFinalEpoch,
                               false,
                               activeThirdBodies,
                               skippedThirdBodies);
-        addThirdBodyIfCovered(thirdBody,
+        addThirdBodyIfCovered(thirdBodies,
                               {kGanymede, kGanymedeMuKm3PerSec2},
                               dynamicsStartEpoch,
                               dynamicsFinalEpoch,
                               false,
                               activeThirdBodies,
                               skippedThirdBodies);
-        addThirdBodyIfCovered(thirdBody,
+        addThirdBodyIfCovered(thirdBodies,
                               {kCallisto, kCallistoMuKm3PerSec2},
                               dynamicsStartEpoch,
                               dynamicsFinalEpoch,
                               false,
                               activeThirdBodies,
                               skippedThirdBodies);
-        addThirdBodyIfCovered(thirdBody,
+        addThirdBodyIfCovered(thirdBodies,
                               {kSaturnBarycenter, kSaturnSystemMuKm3PerSec2},
                               dynamicsStartEpoch,
                               dynamicsFinalEpoch,
@@ -1241,7 +1511,7 @@ int main() {
                                                       kVoyagerReflectivity,
                                                       kVoyagerAreaM2,
                                                       kVoyagerMassKg);
-        const auto dynamics = makeDynamics(thirdBody, srp);
+        const auto dynamics = makeDynamics(thirdBodies, srp);
         const od::EphemerisInterpolator truthEphemeris =
             propagateObservationEphemeris(observations,
                                           vlbiObservations,
@@ -1258,59 +1528,78 @@ int main() {
         filter.setInitialState(priorState, priorCovariance, referenceEpoch);
 
         const Eigen::VectorXd measured = measuredVector(observations, vlbiObservations);
-        const Eigen::MatrixXd covariance = measurementCovariance(observations, vlbiObservations);
+        const Eigen::VectorXd variances = measurementVariances(observations, vlbiObservations);
         const Prediction prefitPrediction = predictObservations(observations,
                                                                 vlbiObservations,
+                                                                stationEphemerides,
                                                                 integrator,
                                                                 dynamics,
                                                                 referenceEpoch,
                                                                 priorState);
 
+	        fd::filters::BatchLeastSquaresDriver::ConvergenceCriteria solverCriteria;
+	        solverCriteria.maxIterations = kMaxSolverIterations;
+	        solverCriteria.minimumIterations = 5;
+	        solverCriteria.weightedRmsTolerance = 1.01;
+
         std::vector<IterationRecord> iterationRecords;
-        for (int iteration = 0; iteration < kMaxSolverIterations; ++iteration) {
-            const State6 currentState = stateAtEpoch(filter);
-            const Prediction prediction = predictObservations(observations,
-                                                              vlbiObservations,
-                                                              integrator,
-                                                              dynamics,
-                                                              referenceEpoch,
-                                                              currentState);
-            const Eigen::VectorXd residuals = measured - prediction.values;
-            const ResidualStats stats = computeStats(residuals, observations, vlbiObservations);
-            const Eigen::MatrixXd design = finiteDifferenceDesignMatrix(observations,
-                                                                        vlbiObservations,
-                                                                        integrator,
-                                                                        dynamics,
-                                                                        referenceEpoch,
-                                                                        currentState);
+        std::vector<IterationResidualSnapshot> iterationResiduals;
+        iterationResiduals.reserve(static_cast<std::size_t>(kMaxSolverIterations));
+        fd::filters::BatchLeastSquaresDriver solver(
+            filter,
+            [&](const Eigen::VectorXd& state) {
+                const State6 currentState = asState6(state, "Batch least-squares state");
+                const Prediction prediction = predictObservations(observations,
+                                                                  vlbiObservations,
+                                                                  stationEphemerides,
+                                                                  integrator,
+                                                                  dynamics,
+                                                                  referenceEpoch,
+                                                                  currentState);
+                fd::filters::BatchLeastSquaresDriver::LinearizedProblem problem;
+                problem.residuals = measured - prediction.values;
+                problem.designMatrix = finiteDifferenceDesignMatrix(observations,
+                                                                    vlbiObservations,
+                                                                    stationEphemerides,
+                                                                    integrator,
+                                                                    dynamics,
+                                                                    referenceEpoch,
+                                                                    currentState);
+                problem.measurementVariances = variances;
+                return problem;
+            },
+            solverCriteria);
 
-            filter.processBatch(residuals, design, covariance);
+        const fd::filters::BatchLeastSquaresDriver::Result solverResult =
+            solver.solve([&](const fd::filters::BatchLeastSquaresDriver::IterationSummary& iteration) {
+                const State6 updatedState = asState6(iteration.stateAfter,
+                                                     "Batch least-squares updated state");
+                const State6 updatedError = updatedState - truthState;
+                const ResidualStats stats = computeStats(iteration.residuals,
+                                                         observations,
+                                                         vlbiObservations);
 
-            const State6 updatedState = stateAtEpoch(filter);
-            const State6 correction = updatedState - currentState;
-            const State6 updatedError = updatedState - truthState;
-
-            iterationRecords.push_back(IterationRecord{
-                iteration + 1,
-                stats.weightedRms,
-                stats.rangeRmsKm,
-                stats.rangeRateRmsKmPerSec,
-                stats.vlbiRmsKm,
-                correction.segment<3>(0).norm(),
-                correction.segment<3>(3).norm(),
-                updatedError.segment<3>(0).norm(),
-                updatedError.segment<3>(3).norm()
+                iterationRecords.push_back(IterationRecord{
+                    static_cast<int>(iteration.iteration),
+                    stats.weightedRms,
+                    stats.rangeRmsKm,
+                    stats.rangeRateRmsKmPerSec,
+                    stats.vlbiRmsKm,
+                    iteration.correction.segment<3>(0).norm(),
+                    iteration.correction.segment<3>(3).norm(),
+                    updatedError.segment<3>(0).norm(),
+                    updatedError.segment<3>(3).norm()
+                });
+                iterationResiduals.push_back(IterationResidualSnapshot{
+                    static_cast<int>(iteration.iteration),
+                    iteration.residuals
+                });
             });
-
-            if (correction.segment<3>(0).norm() < 1.0e-3
-                && correction.segment<3>(3).norm() < 1.0e-8) {
-                break;
-            }
-        }
 
         const State6 estimatedState = stateAtEpoch(filter);
         const Prediction postfitPrediction = predictObservations(observations,
                                                                  vlbiObservations,
+                                                                 stationEphemerides,
                                                                  integrator,
                                                                  dynamics,
                                                                  referenceEpoch,
@@ -1333,10 +1622,12 @@ int main() {
 
         writeReport(kReportPath,
                     observationPath,
-                    observations,
-                    vlbiObservations,
-                    iterationRecords,
-                    prefitPrediction,
+	                    observations,
+	                    vlbiObservations,
+	                    iterationRecords,
+	                    solverResult,
+	                    solverCriteria,
+	                    prefitPrediction,
                     postfitPrediction,
                     truthState,
                     truthEphemeris,
@@ -1356,6 +1647,12 @@ int main() {
                                    truthEphemeris,
                                    estimatedEphemeris,
                                    referenceEpoch);
+        writeIterationResidualsCsv(kIterationResidualsCsvPath,
+                                   observations,
+                                   vlbiObservations,
+                                   iterationResiduals,
+                                   referenceEpoch);
+        writeIterationSummaryCsv(kIterationSummaryCsvPath, iterationRecords);
         writeTrajectoryErrorCsv(kTrajectoryErrorCsvPath,
                                 observations,
                                 truthEphemeris,
@@ -1365,13 +1662,22 @@ int main() {
                                      observations,
                                      referenceEpoch);
 
+        const double elapsedSeconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - scriptStart).count();
+
         std::cout << std::scientific << std::setprecision(9)
                   << "Voyager multi-station OD from synthetic report\n"
-                  << "  station observations          : " << observations.size() << '\n'
-                  << "  VLBI observations             : " << vlbiObservations.size() << '\n'
+	                  << "  station observations          : " << observations.size() << '\n'
+	                  << "  VLBI observations             : " << vlbiObservations.size() << '\n'
+	                  << "  solver status                 : " << solverResult.statusName() << '\n'
+	                  << "  WLS iterations requested      : " << solverCriteria.maxIterations << '\n'
+	                  << "  WLS iterations completed      : " << solverResult.iterationCount() << '\n'
+                  << "  cached station ephemerides    : " << stationEphemerides.size() << '\n'
                   << "  input report                  : " << observationPath.string() << '\n'
                   << "  output report                 : " << kReportPath << '\n'
                   << "  post-fit diagnostics CSV      : " << kPostfitDiagnosticsCsvPath << '\n'
+                  << "  WLS iteration residuals CSV   : " << kIterationResidualsCsvPath << '\n'
+                  << "  WLS iteration summary CSV     : " << kIterationSummaryCsvPath << '\n'
                   << "  trajectory error CSV          : " << kTrajectoryErrorCsvPath << '\n'
                   << "  observability windows CSV     : " << kObservabilityWindowsCsvPath << '\n'
                   << "  active third bodies           : ";
@@ -1395,12 +1701,21 @@ int main() {
                   << "  prior position error          : " << priorPositionErrorKm << " km\n"
                   << "  posterior position error      : " << posteriorPositionErrorKm << " km\n"
                   << "  posterior velocity error      : "
-                  << (estimatedState - truthState).segment<3>(3).norm() << " km/s\n";
+                  << (estimatedState - truthState).segment<3>(3).norm() << " km/s\n"
+                  << "  wall-clock runtime            : " << elapsedSeconds << " s\n";
+        if (solverResult.converged()) {
+            std::cout << "  WLS converged in iterations   : "
+                      << solverResult.iterationCount() << '\n';
+	        }
 
-        if (!filter.covariance().allFinite()) {
-            std::cerr << "FAIL: posterior covariance contains non-finite values.\n";
-            return EXIT_FAILURE;
-        }
+	        if (!filter.covariance().allFinite()) {
+	            std::cerr << "FAIL: posterior covariance contains non-finite values.\n";
+	            return EXIT_FAILURE;
+	        }
+	        if (!solverResult.converged()) {
+	            std::cerr << "FAIL: batch least-squares driver did not converge.\n";
+	            return EXIT_FAILURE;
+	        }
         if (postfitStats.weightedRms >= prefitStats.weightedRms) {
             std::cerr << "FAIL: weighted residual RMS did not decrease.\n";
             return EXIT_FAILURE;
@@ -1413,7 +1728,11 @@ int main() {
         kclear_c();
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
+        const double elapsedSeconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - scriptStart).count();
         std::cerr << "Voyager position OD test failed: " << error.what() << '\n';
+        std::cerr << "Voyager position OD elapsed before failure: "
+                  << std::fixed << std::setprecision(3) << elapsedSeconds << " s\n";
         kclear_c();
         return EXIT_FAILURE;
     }

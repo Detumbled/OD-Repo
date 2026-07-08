@@ -1,3 +1,4 @@
+#include "filters/BatchLeastSquaresDriver.hpp"
 #include "filters/WLS.hpp"
 
 #include <Eigen/Dense>
@@ -112,6 +113,31 @@ struct SyntheticBatch {
     return residuals;
 }
 
+[[nodiscard]] fd::filters::BatchLeastSquaresDriver::LinearizedProblem linearizeRangeBatch(
+    const SyntheticBatch& batch,
+    const Eigen::VectorXd& epochState) {
+    fd::filters::BatchLeastSquaresDriver::LinearizedProblem problem;
+    problem.residuals.resize(batch.observed_ranges.size());
+    problem.designMatrix.resize(batch.observed_ranges.size(), epochState.size());
+    problem.measurementVariances =
+        Eigen::VectorXd::Constant(batch.observed_ranges.size(), kRangeSigmaKm * kRangeSigmaKm);
+
+    for (Eigen::Index row = 0; row < batch.observed_ranges.size(); ++row) {
+        const double dt = batch.epochs_sec[row];
+        const Eigen::Vector3d position = positionAt(epochState, dt);
+        const Eigen::Vector3d line_of_sight = position - batch.station_position_km;
+        const double range = line_of_sight.norm();
+        const Eigen::Vector3d range_unit = line_of_sight / range;
+
+        problem.residuals[row] = batch.observed_ranges[row] - range;
+        problem.designMatrix.row(row).setZero();
+        problem.designMatrix.block<1, 3>(row, 0) = range_unit.transpose();
+        problem.designMatrix.block<1, 3>(row, 3) = dt * range_unit.transpose();
+    }
+
+    return problem;
+}
+
 [[nodiscard]] double rms(const Eigen::VectorXd& values) {
     return std::sqrt(values.squaredNorm() / static_cast<double>(values.size()));
 }
@@ -140,26 +166,65 @@ int main() {
         filter.setInitialState(batch.prior_state, prior_covariance, 0.0);
         filter.processBatch(batch.residuals, batch.design_matrix, batch.measurement_covariance);
 
+        fd::filters::WLS streaming_filter;
+        streaming_filter.setInitialState(batch.prior_state, prior_covariance, 0.0);
+        for (Eigen::Index row = 0; row < batch.residuals.size(); ++row) {
+            streaming_filter.addMeasurement(batch.residuals[row],
+                                            batch.design_matrix.row(row),
+                                            kRangeSigmaKm);
+        }
+        const Eigen::VectorXd streaming_correction = streaming_filter.solveAndUpdate();
+        const Eigen::VectorXd streaming_postfit_residuals =
+            batch.residuals - batch.design_matrix * streaming_correction;
+
         const Eigen::VectorXd nonlinear_postfit_residuals = computeRangeResiduals(batch.observed_ranges,
                                                                                   batch.epochs_sec,
                                                                                   batch.station_position_km,
                                                                                   filter.state());
 
+        fd::filters::WLS driver_filter;
+        driver_filter.setInitialState(batch.prior_state, prior_covariance, 0.0);
+        fd::filters::BatchLeastSquaresDriver::ConvergenceCriteria driver_criteria;
+        driver_criteria.maxIterations = 8;
+        driver_criteria.correctionBlockTolerances = {
+            {0, 3, 1.0e-4},
+            {3, 3, 1.0e-8}
+        };
+        fd::filters::BatchLeastSquaresDriver driver(
+            driver_filter,
+            [&batch](const Eigen::VectorXd& state) {
+                return linearizeRangeBatch(batch, state);
+            },
+            driver_criteria);
+        const fd::filters::BatchLeastSquaresDriver::Result driver_result = driver.solve();
+        const Eigen::VectorXd driver_postfit_residuals =
+            computeRangeResiduals(batch.observed_ranges,
+                                  batch.epochs_sec,
+                                  batch.station_position_km,
+                                  driver_filter.state());
+
         const double prefit_rms_km = rms(batch.nonlinear_prefit_residuals);
         const double postfit_rms_km = rms(filter.lastPostfitResiduals());
         const double nonlinear_postfit_rms_km = rms(nonlinear_postfit_residuals);
+        const double driver_postfit_rms_km = rms(driver_postfit_residuals);
         const double prior_position_error_km = (batch.prior_state.segment<3>(0)
                                                 - batch.true_state.segment<3>(0)).norm();
         const double posterior_position_error_km = (filter.state().segment<3>(0)
                                                     - batch.true_state.segment<3>(0)).norm();
+        const double driver_position_error_km = (driver_filter.state().segment<3>(0)
+                                                - batch.true_state.segment<3>(0)).norm();
 
         std::cout << std::fixed << std::setprecision(9)
                   << "Synthetic WLS batch test\n"
                   << "  observations          : " << batch.residuals.size() << '\n'
+                  << "  streamed measurements : " << streaming_filter.accumulatedMeasurementCount() << '\n'
                   << "  range sigma           : " << kRangeSigmaKm * 1000.0 << " m\n"
                   << "  pre-fit O-C RMS       : " << prefit_rms_km * 1000.0 << " m\n"
                   << "  post-fit O-C RMS      : " << postfit_rms_km * 1000.0 << " m\n"
                   << "  nonlinear post RMS    : " << nonlinear_postfit_rms_km * 1000.0 << " m\n"
+                  << "  driver status         : " << driver_result.statusName() << '\n'
+                  << "  driver iterations     : " << driver_result.iterationCount() << '\n'
+                  << "  driver post RMS       : " << driver_postfit_rms_km * 1000.0 << " m\n"
                   << "  state correction      : " << filter.lastStateCorrection().transpose() << '\n';
 
         printStateDelta("Prior state error", batch.prior_state, batch.true_state);
@@ -177,6 +242,29 @@ int main() {
 
         if (posterior_position_error_km >= prior_position_error_km) {
             std::cerr << "FAIL: WLS did not reduce the epoch position error.\n";
+            return EXIT_FAILURE;
+        }
+
+        if (!driver_result.converged()) {
+            std::cerr << "FAIL: batch least-squares driver did not report convergence.\n";
+            return EXIT_FAILURE;
+        }
+
+        if (driver_postfit_rms_km >= nonlinear_postfit_rms_km) {
+            std::cerr << "FAIL: batch least-squares driver did not improve nonlinear postfit RMS.\n";
+            return EXIT_FAILURE;
+        }
+
+        if (driver_position_error_km >= prior_position_error_km) {
+            std::cerr << "FAIL: batch least-squares driver did not reduce the epoch position error.\n";
+            return EXIT_FAILURE;
+        }
+
+        if (!filter.state().isApprox(streaming_filter.state(), 1.0e-10)
+            || !filter.lastStateCorrection().isApprox(streaming_correction, 1.0e-10)
+            || !filter.lastPostfitResiduals().isApprox(streaming_postfit_residuals, 1.0e-10)
+            || !filter.lastInformationMatrix().isApprox(streaming_filter.informationMatrix(), 1.0e-7)) {
+            std::cerr << "FAIL: sequential WLS accumulation does not match the batch wrapper.\n";
             return EXIT_FAILURE;
         }
 

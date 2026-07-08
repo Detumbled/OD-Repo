@@ -67,11 +67,13 @@ than explicitly forming inverse measurement covariance.
 - `tests/test_voyager_position_od.cpp`
 
 The generic `RangeSynth`/`RangeRateSynth` classes use CSPICE geometry, optional
-Gaussian noise, and solar Shapiro delay. The Voyager synthetic test now seeds
-Voyager's initial state from CSPICE once, propagates it with RKF45 and the OD
-dynamics, applies manual one-way light-time against that propagated ephemeris,
-and keeps only samples above the station elevation mask. The DSS-43/DSS-63
-Voyager report is generated at:
+Gaussian noise, and solar Shapiro delay. `RangeRateSynth` models Doppler as
+centered differenced range over a configurable count time, defaulting to 60 s,
+and scales its sigma by `1 / sqrt(count_time_s)`. The Voyager synthetic test
+now seeds Voyager's initial state from CSPICE once, propagates it with RKF45 and
+the OD dynamics, applies manual one-way light-time against that propagated
+ephemeris, and keeps only samples above the station elevation mask. The Voyager
+synthetic report is generated at:
 
 ```text
 synthetic_observations_dss43_voyager1.txt
@@ -162,34 +164,44 @@ SRP acceleration norm                = 2.941469913405e-12 km/s^2
 ```text
 Stations: DSS-43, DSS-63
 Target: Voyager 1 (-31)
-Requested arc: 1979-01-10T00:00:00 to 1979-01-12T00:00:00
+Requested arc: 1979-01-10T00:00:00 to 1979-01-14T00:00:00
 Elevation mask: 10 deg
 Cadence: 180 s
-Samples after mask: 828 total; DSS-43 330, DSS-63 498
+VLBI cadence: 20 s
+Samples after mask: 1655 total; DSS-43 659, DSS-63 996
+VLBI samples after mask: 2902 total; DSS-43/DSS-63 82, DSS-14/DSS-43 2820
 Range sigma: 0.010 km
-Range-rate sigma: 1.0e-6 km/s
+Range-rate base sigma: 1.0e-6 km/s at 1 s
+Range-rate count time: 60 s
+Range-rate row sigma: 1.290994e-7 km/s
+VLBI sigma: 0.001 km
 ```
 
 `test_voyager_position_od` reads that report and estimates the initial Voyager
-state with the same RKF45 truth dynamics used by the synthetic generator:
+state with DP853 propagation and cached SPICE body/station states:
 Sun gravity, Jupiter body `599`, Galilean moons `501-504`, Saturn barycenter
-`6`, SRP, light-time, and Shapiro delay. Its debug report is generated at
+`6`, SRP, light-time, Shapiro delay, centered count-time range-rate, and VLBI
+differential range. Its debug report is generated at
 `tests/voyager_position_estimation_report.txt`. It also exports plotting CSVs:
-`tests/voyager_od_postfit_diagnostics.csv`,
-`tests/voyager_od_trajectory_error.csv`, and
-`tests/voyager_station_observability_windows.csv`.
+`tests/voyager_od_postfit_diagnostics_VLBI.csv`,
+`tests/voyager_od_trajectory_error_VLBI.csv`, and
+`tests/voyager_station_observability_windows_VLBI.csv`.
 
 Latest verified `jup310.bsp` run:
 
 ```text
 Active third bodies: 599 501 502 503 504 6
 Prior position error:      70.710678 km
-Posterior position error:  49.750025 km
-Prefit range RMS:          99187.418 m
-Postfit range RMS:         9.616 m
-Prefit range-rate RMS:     529.418 mm/s
-Postfit range-rate RMS:    1.035 mm/s
-OD test runtime:           about 80 s
+Posterior position error:  5.766723 km
+Solver status:             CONVERGED in 5 iterations
+Solver weighted RMS:       0.694371
+Prefit range RMS:          150770.580 m
+Postfit range RMS:         9.671 m
+Prefit range-rate RMS:     528.089 mm/s
+Postfit range-rate RMS:    0.179 mm/s
+Prefit VLBI RMS:           1.598 m
+Postfit VLBI RMS:          1.005 m
+OD test runtime:           about 4 s
 ```
 
 ## Worktree Caution
