@@ -22,6 +22,10 @@ public:
     [[nodiscard]] std::vector<SyntheticObservationSample> generate(double startTdb,
                                                                    double endTdb,
                                                                    double stepSeconds) override;
+    [[nodiscard]] std::vector<SyntheticObservationSample> generate(double startTdb,
+                                                                   double endTdb,
+                                                                   double stepSeconds,
+                                                                   const TargetStateProvider& targetProvider);
 
     [[nodiscard]] std::vector<SyntheticObservationSample> generate(double startTdb,
                                                                    double endTdb,
@@ -29,6 +33,13 @@ public:
                                                                    const std::string& stationOneName,
                                                                    const std::string& stationTwoName,
                                                                    const std::string& target);
+    [[nodiscard]] std::vector<SyntheticObservationSample> generate(double startTdb,
+                                                                   double endTdb,
+                                                                   double stepSeconds,
+                                                                   const std::string& stationOneName,
+                                                                   const std::string& stationTwoName,
+                                                                   const std::string& target,
+                                                                   const TargetStateProvider& targetProvider);
 
     [[nodiscard]] const VLBIConfig& vlbiConfig() const noexcept;
 
@@ -37,6 +48,12 @@ private:
                                                                              double endTdb,
                                                                              double stepSeconds,
                                                                              const VLBIConfig& vlbi);
+    [[nodiscard]] std::vector<SyntheticObservationSample> generateWithConfig(
+        double startTdb,
+        double endTdb,
+        double stepSeconds,
+        const VLBIConfig& vlbi,
+        const TargetStateProvider& targetProvider);
 
     VLBIConfig vlbi_;
 };

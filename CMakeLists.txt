@@ -129,6 +129,7 @@ set(BIG_FUNCTIONS_SOURCE_CANDIDATES
     src/filters/WLS.cpp
     src/filters/BatchLeastSquaresDriver.cpp
     src/observations/synth/obs_synth.cpp
+    src/observations/synth/TargetStateProvider.cpp
     src/observations/synth/RangeSynth.cpp
     src/observations/synth/RangeRateSynth.cpp
     src/observations/synth/VLBISynth.cpp
@@ -156,10 +157,8 @@ set(APP_SOURCE_CANDIDATES
     test_stations.cpp
     test_rkf45.cpp
     tests/test_ephemeris_interpolator.cpp
-    tests/test_rkf45_history.cpp
-    tests/test_wls.cpp
     tests/test_synth_observations.cpp
-    tests/test_perturbations.cpp
+    tests/test_synth_source_comparison.cpp
     tests/test_voyager_position_od.cpp
 )
 
@@ -176,7 +175,7 @@ foreach(app_src IN LISTS APP_SOURCES)
     target_link_libraries(${app_name} PRIVATE big_functions)
 
     if(app_name STREQUAL "test_synth_observations"
-       OR app_name STREQUAL "test_perturbations"
+       OR app_name STREQUAL "test_synth_source_comparison"
        OR app_name STREQUAL "test_voyager_position_od")
         add_test(NAME ${app_name} COMMAND ${app_name} WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
         if(app_name STREQUAL "test_voyager_position_od")

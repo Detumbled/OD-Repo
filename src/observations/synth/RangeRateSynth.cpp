@@ -64,4 +64,49 @@ std::vector<SyntheticObservationSample> RangeRateSynth::generate(double startTdb
     return samples;
 }
 
+std::vector<SyntheticObservationSample> RangeRateSynth::generate(
+    double startTdb,
+    double endTdb,
+    double stepSeconds,
+    double countTimeSeconds,
+    const TargetStateProvider& targetProvider) {
+    validateCountTime(countTimeSeconds);
+    const std::vector<double> epochs = makeEpochGrid(startTdb, endTdb, stepSeconds);
+    const double half_count_time = 0.5 * countTimeSeconds;
+    const double scaled_sigma = noiseConfig().sigma / std::sqrt(countTimeSeconds);
+
+    std::vector<SyntheticObservationSample> samples;
+    samples.reserve(epochs.size());
+
+    for (const double epoch : epochs) {
+        const RelativeGeometry start_geometry =
+            relativeTargetGeometry(epoch - half_count_time, targetProvider);
+        const RelativeGeometry end_geometry =
+            relativeTargetGeometry(epoch + half_count_time, targetProvider);
+        const double start_range =
+            start_geometry.stationToTargetState.segment<3>(0).norm()
+            + shapiroRangeDelayFor(geometryConfig().stationName, start_geometry, targetProvider);
+        const double end_range =
+            end_geometry.stationToTargetState.segment<3>(0).norm()
+            + shapiroRangeDelayFor(geometryConfig().stationName, end_geometry, targetProvider);
+
+        if (start_range <= 0.0 || end_range <= 0.0) {
+            throw std::runtime_error("Synthetic range-rate geometry has zero line-of-sight range.");
+        }
+
+        const double truth = (end_range - start_range) / countTimeSeconds;
+        const double noise = drawNoise(scaled_sigma);
+
+        samples.push_back(SyntheticObservationSample{
+            epoch,
+            truth,
+            noise,
+            truth + noise,
+            scaled_sigma
+        });
+    }
+
+    return samples;
+}
+
 } // namespace fd::observations::synth

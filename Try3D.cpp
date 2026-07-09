@@ -1,7 +1,7 @@
 
 
 #define GL_SILENCE_DEPRECATION
-#include "cspice_wrapper.hpp"
+#include "utils/CSPICE/SpiceError.hpp"
 
 #define GLFW_INCLUDE_GLCOREARB
 
@@ -59,15 +59,14 @@ int main() {
     // ---------------------------------------------------------
     // 2. CSPICE TRAJECTORY GENERATION
     // ---------------------------------------------------------
-    erract_c("SET", 0, const_cast<SpiceChar*>("RETURN"));
-    errprt_c("SET", 0, const_cast<SpiceChar*>("NONE"));
+    const od::SpiceErrorModeGuard spice_error_mode("RETURN", "NONE");
     furnsh_c("../kernels.tm");
-    ensureNoSpiceError("Loading kernels");
+    od::ensureNoSpiceError("Loading kernels");
 
     SpiceDouble et_start, et_end;
     str2et_c("1978-02-01T00:00:00", &et_start); 
         str2et_c("1990-04-01T00:00:00", &et_end);
-    ensureNoSpiceError("Time conversion");
+    od::ensureNoSpiceError("Time conversion");
 
     // OpenGL richiede array 1D continui di float [x1, y1, z1, x2, y2, z2...]
     std::vector<float> earth_verts, jupiter_verts, saturn_verts, vgr_verts;

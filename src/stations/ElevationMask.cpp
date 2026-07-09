@@ -1,37 +1,18 @@
 #include "stations/ElevationMask.hpp"
 
 #include "stations/StationCatalog.hpp"
+#include "utils/CSPICE/SpiceError.hpp"
 
 #include <SpiceUsr.h>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
-#include <sstream>
 #include <stdexcept>
 
 namespace od {
 namespace {
 
-using SpiceErrorActionBuffer = std::array<SpiceChar, 32>;
-
-class SpiceErrorActionGuard {
-public:
-    SpiceErrorActionGuard() {
-        erract_c("GET", static_cast<SpiceInt>(previous_action_.size()), previous_action_.data());
-        erract_c("SET", 0, const_cast<SpiceChar*>("RETURN"));
-    }
-
-    SpiceErrorActionGuard(const SpiceErrorActionGuard&) = delete;
-    SpiceErrorActionGuard& operator=(const SpiceErrorActionGuard&) = delete;
-
-    ~SpiceErrorActionGuard() {
-        erract_c("SET", 0, previous_action_.data());
-    }
-
-private:
-    SpiceErrorActionBuffer previous_action_ {};
-};
+using od::throwIfSpiceFailed;
 
 [[nodiscard]] std::string stationObserverName(const std::string& stationName) {
     try {
@@ -39,22 +20,6 @@ private:
     } catch (const std::invalid_argument&) {
         return stationName;
     }
-}
-
-void throwIfSpiceFailed(const std::string& context) {
-    if (!failed_c()) {
-        return;
-    }
-
-    SpiceChar short_message[1841] = {0};
-    SpiceChar long_message[1841] = {0};
-    getmsg_c("SHORT", sizeof(short_message), short_message);
-    getmsg_c("LONG", sizeof(long_message), long_message);
-    reset_c();
-
-    std::ostringstream message;
-    message << context << ": " << short_message << " | " << long_message;
-    throw std::runtime_error(message.str());
 }
 
 void validateInputs(const std::string& target,
@@ -84,7 +49,7 @@ TopocentricTargetGeometry computeTopocentricTargetGeometry(
     const std::string& aberrationCorrection) {
     validateInputs(target, stationName, epochTdb, aberrationCorrection);
 
-    SpiceErrorActionGuard action_guard;
+    SpiceErrorModeGuard action_guard;
 
     const std::string observer = stationObserverName(stationName);
     SpiceDouble station_position[3] = {0.0, 0.0, 0.0};

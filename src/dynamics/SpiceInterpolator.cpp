@@ -1,6 +1,6 @@
 #include "dynamics/SpiceInterpolator.hpp"
 
-#include "cspice_wrapper.hpp"
+#include "utils/CSPICE/SpiceError.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -65,7 +65,7 @@ void SpiceInterpolator::initialize(const std::string& target,
     sampledPositions.reserve(reserveCount);
     sampledVelocities.reserve(reserveCount);
 
-    SpiceErrorActionGuard actionGuard;
+    SpiceErrorModeGuard actionGuard;
 
     for (std::size_t i = 0; i <= regularIntervals; ++i) {
         const double et = startEt + static_cast<double>(i) * stepSec;

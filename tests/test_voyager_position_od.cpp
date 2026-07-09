@@ -1,5 +1,4 @@
 #include "stations/StationCatalog.hpp"
-#include "cspice_wrapper.hpp"
 #include "DP853Integrator.hpp"
 #include "dynamics/EphemerisInterpolator.hpp"
 #include "dynamics/SpiceInterpolator.hpp"
@@ -7,6 +6,7 @@
 #include "filters/WLS.hpp"
 #include "perturbations/SRP.hpp"
 #include "perturbations/Shapiro.hpp"
+#include "utils/CSPICE/SpiceError.hpp"
 
 #include <Eigen/Dense>
 
@@ -1415,7 +1415,7 @@ void writeReport(const std::filesystem::path& path,
 int main() {
     const auto scriptStart = std::chrono::steady_clock::now();
     try {
-        const od::SpiceErrorModeGuard spiceErrorMode;
+        const od::SpiceErrorModeGuard spiceErrorMode("RETURN", "NONE");
 
         furnsh_c(kMetaKernel);
         throwIfSpiceFailed("Failed to load Voyager OD meta-kernel");

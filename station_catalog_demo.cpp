@@ -1,4 +1,5 @@
 #include "stations/StationCatalog.hpp"
+#include "utils/CSPICE/SpiceError.hpp"
 
 #include <SpiceUsr.h>
 
@@ -13,24 +14,9 @@ namespace {
 constexpr double kDegreeTolerance = 0.05;
 constexpr double kAltitudeToleranceKm = 0.05;
 
-void configureSpiceToReturn() {
-    erract_c("SET", 0, const_cast<SpiceChar*>("RETURN"));
-    errprt_c("SET", 0, const_cast<SpiceChar*>("NONE"));
-}
-
 void loadKernelPool(const char* metakernelPath) {
     furnsh_c(metakernelPath);
-
-    if (failed_c()) {
-        SpiceChar short_message[1841] = {0};
-        SpiceChar long_message[1841] = {0};
-        getmsg_c("SHORT", sizeof(short_message), short_message);
-        getmsg_c("LONG", sizeof(long_message), long_message);
-        reset_c();
-
-        throw std::runtime_error(std::string("Failed to load meta-kernel: ")
-                                 + short_message + " | " + long_message);
-    }
+    od::throwIfSpiceFailed("Failed to load meta-kernel");
 }
 
 double degreesToRadians(double degrees) {
@@ -63,23 +49,14 @@ void printStationSummary(const od::Station& station) {
 
 int main(int argc, char** argv) {
     try {
-        configureSpiceToReturn();
+        const od::SpiceErrorModeGuard spice_error_mode("RETURN", "NONE");
 
         const char* metakernel = argc > 1 ? argv[1] : "../Kernels.tm";
         loadKernelPool(metakernel);
 
         SpiceDouble reference_et = 0.0;
         str2et_c("2026-06-21T00:00:00", &reference_et);
-        if (failed_c()) {
-            SpiceChar short_message[1841] = {0};
-            SpiceChar long_message[1841] = {0};
-            getmsg_c("SHORT", sizeof(short_message), short_message);
-            getmsg_c("LONG", sizeof(long_message), long_message);
-            reset_c();
-
-            throw std::runtime_error(std::string("Failed to convert reference epoch: ")
-                                     + short_message + " | " + long_message);
-        }
+        od::throwIfSpiceFailed("Failed to convert reference epoch");
 
         const std::vector<od::StationCatalogEntry> network = {
             {"DSS-14", od::stationNaifIdFromName("DSS-14")},

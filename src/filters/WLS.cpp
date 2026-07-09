@@ -1,37 +1,18 @@
 #include "filters/WLS.hpp"
 
 #include "stations/StationCatalog.hpp"
+#include "utils/CSPICE/SpiceError.hpp"
 
 #include <SpiceUsr.h>
 
-#include <array>
 #include <cmath>
-#include <sstream>
 #include <stdexcept>
 #include <utility>
 
 namespace fd::filters {
 namespace {
 
-using SpiceErrorActionBuffer = std::array<SpiceChar, 32>;
-
-class SpiceErrorActionGuard {
-public:
-    SpiceErrorActionGuard() {
-        erract_c("GET", static_cast<SpiceInt>(previous_action_.size()), previous_action_.data());
-        erract_c("SET", 0, const_cast<SpiceChar*>("RETURN"));
-    }
-
-    SpiceErrorActionGuard(const SpiceErrorActionGuard&) = delete;
-    SpiceErrorActionGuard& operator=(const SpiceErrorActionGuard&) = delete;
-
-    ~SpiceErrorActionGuard() {
-        erract_c("SET", 0, previous_action_.data());
-    }
-
-private:
-    SpiceErrorActionBuffer previous_action_ {};
-};
+using od::throwIfSpiceFailed;
 
 [[nodiscard]] std::string spiceTargetName(const std::string& stationName) {
     try {
@@ -39,22 +20,6 @@ private:
     } catch (const std::invalid_argument&) {
         return stationName;
     }
-}
-
-void throwIfSpiceFailed(const std::string& context) {
-    if (!failed_c()) {
-        return;
-    }
-
-    SpiceChar short_message[1841] = {0};
-    SpiceChar long_message[1841] = {0};
-    getmsg_c("SHORT", sizeof(short_message), short_message);
-    getmsg_c("LONG", sizeof(long_message), long_message);
-    reset_c();
-
-    std::ostringstream message;
-    message << context << ": " << short_message << " | " << long_message;
-    throw std::runtime_error(message.str());
 }
 
 void requireFiniteMatrix(const Eigen::MatrixXd& matrix, const char* label) {
@@ -282,7 +247,7 @@ WLS::StationState WLS::getStationState(const std::string& stationName,
     }
 
     // Kernel loading remains the caller's responsibility; this method only queries SPICE.
-    SpiceErrorActionGuard action_guard;
+    od::SpiceErrorModeGuard action_guard;
 
     const std::string target = spiceTargetName(stationName);
     SpiceDouble spice_state[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};

@@ -11,6 +11,10 @@ public:
     [[nodiscard]] std::vector<SyntheticObservationSample> generate(double startTdb,
                                                                    double endTdb,
                                                                    double stepSeconds) override;
+    [[nodiscard]] std::vector<SyntheticObservationSample> generate(double startTdb,
+                                                                   double endTdb,
+                                                                   double stepSeconds,
+                                                                   const TargetStateProvider& targetProvider);
 };
 
 } // namespace fd::observations::synth

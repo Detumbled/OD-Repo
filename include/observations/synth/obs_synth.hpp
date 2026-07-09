@@ -1,5 +1,8 @@
 #pragma once
 
+#include "observations/synth/TargetStateProvider.hpp"
+#include "stations/Stations.hpp"
+
 #include <Eigen/Dense>
 
 #include <cstdint>
@@ -52,6 +55,13 @@ public:
 
     [[nodiscard]] const GeometryConfig& geometryConfig() const noexcept;
     [[nodiscard]] const NoiseConfig& noiseConfig() const noexcept;
+    [[nodiscard]] double targetElevationRad(double receiveEpochTdb,
+                                            const od::Station& station,
+                                            const TargetStateProvider& targetProvider) const;
+    [[nodiscard]] bool isVisibleAboveElevation(double receiveEpochTdb,
+                                               const od::Station& station,
+                                               double minimumElevationRad,
+                                               const TargetStateProvider& targetProvider) const;
 
     [[nodiscard]] static std::vector<double> makeEpochGrid(double startTdb,
                                                            double endTdb,
@@ -60,9 +70,18 @@ public:
 protected:
     [[nodiscard]] Eigen::Matrix<double, 6, 1> relativeTargetState(double epochTdb) const;
     [[nodiscard]] RelativeGeometry relativeTargetGeometry(double receiveEpochTdb) const;
+    [[nodiscard]] RelativeGeometry relativeTargetGeometry(double receiveEpochTdb,
+                                                          const TargetStateProvider& targetProvider) const;
     [[nodiscard]] RelativeGeometry relativeTargetGeometryFor(const std::string& target,
                                                              const std::string& stationName,
                                                              double receiveEpochTdb) const;
+    [[nodiscard]] RelativeGeometry relativeTargetGeometryFor(const std::string& stationName,
+                                                             double receiveEpochTdb,
+                                                             const TargetStateProvider& targetProvider) const;
+    [[nodiscard]] double targetElevationRadFor(const std::string& stationName,
+                                               const od::Station& station,
+                                               double receiveEpochTdb,
+                                               const TargetStateProvider& targetProvider) const;
     [[nodiscard]] Eigen::Matrix<double, 6, 1> sunRelativeState(const std::string& body,
                                                               double epochTdb) const;
     [[nodiscard]] double shapiroRangeDelay(double receiveEpochTdb) const;
@@ -70,6 +89,9 @@ protected:
     [[nodiscard]] double shapiroRangeDelayFor(const std::string& target,
                                               const std::string& stationName,
                                               const RelativeGeometry& geometry) const;
+    [[nodiscard]] double shapiroRangeDelayFor(const std::string& stationName,
+                                              const RelativeGeometry& geometry,
+                                              const TargetStateProvider& targetProvider) const;
     [[nodiscard]] double drawNoise();
     [[nodiscard]] double drawNoise(double sigma);
 

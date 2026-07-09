@@ -1,6 +1,6 @@
 #include "observations/synth/VLBISynth.hpp"
 
-#include "stations/ElevationMask.hpp"
+#include "stations/StationCatalog.hpp"
 
 #include <cmath>
 #include <stdexcept>
@@ -39,6 +39,11 @@ void validateVLBIConfig(const VLBIConfig& vlbi) {
     }
 }
 
+[[nodiscard]] od::Station stationFromKernel(const std::string& stationName, double epochTdb) {
+    const int station_naif_id = od::stationNaifIdFromName(stationName);
+    return od::buildStationFromKernel(stationName, station_naif_id, epochTdb);
+}
+
 } // namespace
 
 VLBISynth::VLBISynth(VLBIConfig vlbi, NoiseConfig noise)
@@ -51,6 +56,14 @@ std::vector<SyntheticObservationSample> VLBISynth::generate(double startTdb,
                                                             double endTdb,
                                                             double stepSeconds) {
     return generateWithConfig(startTdb, endTdb, stepSeconds, vlbi_);
+}
+
+std::vector<SyntheticObservationSample> VLBISynth::generate(
+    double startTdb,
+    double endTdb,
+    double stepSeconds,
+    const TargetStateProvider& targetProvider) {
+    return generateWithConfig(startTdb, endTdb, stepSeconds, vlbi_, targetProvider);
 }
 
 std::vector<SyntheticObservationSample> VLBISynth::generate(double startTdb,
@@ -67,6 +80,22 @@ std::vector<SyntheticObservationSample> VLBISynth::generate(double startTdb,
     return generateWithConfig(startTdb, endTdb, stepSeconds, vlbi);
 }
 
+std::vector<SyntheticObservationSample> VLBISynth::generate(
+    double startTdb,
+    double endTdb,
+    double stepSeconds,
+    const std::string& stationOneName,
+    const std::string& stationTwoName,
+    const std::string& target,
+    const TargetStateProvider& targetProvider) {
+    VLBIConfig vlbi = vlbi_;
+    vlbi.stationOneName = stationOneName;
+    vlbi.stationTwoName = stationTwoName;
+    vlbi.target = target;
+    validateVLBIConfig(vlbi);
+    return generateWithConfig(startTdb, endTdb, stepSeconds, vlbi, targetProvider);
+}
+
 const VLBIConfig& VLBISynth::vlbiConfig() const noexcept {
     return vlbi_;
 }
@@ -75,39 +104,45 @@ std::vector<SyntheticObservationSample> VLBISynth::generateWithConfig(double sta
                                                                       double endTdb,
                                                                       double stepSeconds,
                                                                       const VLBIConfig& vlbi) {
+    const SpiceTargetStateProvider target_provider(vlbi.target, vlbi.frame, "SUN");
+    return generateWithConfig(startTdb, endTdb, stepSeconds, vlbi, target_provider);
+}
+
+std::vector<SyntheticObservationSample> VLBISynth::generateWithConfig(
+    double startTdb,
+    double endTdb,
+    double stepSeconds,
+    const VLBIConfig& vlbi,
+    const TargetStateProvider& targetProvider) {
     const std::vector<double> epochs = makeEpochGrid(startTdb, endTdb, stepSeconds);
+    const od::Station station_one = stationFromKernel(vlbi.stationOneName, startTdb);
+    const od::Station station_two = stationFromKernel(vlbi.stationTwoName, startTdb);
 
     std::vector<SyntheticObservationSample> samples;
     samples.reserve(epochs.size());
 
     for (const double epoch : epochs) {
         const bool station_one_visible =
-            od::isVisibleAboveElevation(vlbi.target,
-                                        vlbi.stationOneName,
-                                        epoch,
-                                        vlbi.minimumElevationRad,
-                                        vlbi.aberrationCorrection);
+            targetElevationRadFor(vlbi.stationOneName, station_one, epoch, targetProvider)
+            >= vlbi.minimumElevationRad;
         const bool station_two_visible =
-            od::isVisibleAboveElevation(vlbi.target,
-                                        vlbi.stationTwoName,
-                                        epoch,
-                                        vlbi.minimumElevationRad,
-                                        vlbi.aberrationCorrection);
+            targetElevationRadFor(vlbi.stationTwoName, station_two, epoch, targetProvider)
+            >= vlbi.minimumElevationRad;
         if (!station_one_visible || !station_two_visible) {
             continue;
         }
 
         const RelativeGeometry station_one_geometry =
-            relativeTargetGeometryFor(vlbi.target, vlbi.stationOneName, epoch);
+            relativeTargetGeometryFor(vlbi.stationOneName, epoch, targetProvider);
         const RelativeGeometry station_two_geometry =
-            relativeTargetGeometryFor(vlbi.target, vlbi.stationTwoName, epoch);
+            relativeTargetGeometryFor(vlbi.stationTwoName, epoch, targetProvider);
 
         const double station_one_range =
             station_one_geometry.stationToTargetState.segment<3>(0).norm()
-            + shapiroRangeDelayFor(vlbi.target, vlbi.stationOneName, station_one_geometry);
+            + shapiroRangeDelayFor(vlbi.stationOneName, station_one_geometry, targetProvider);
         const double station_two_range =
             station_two_geometry.stationToTargetState.segment<3>(0).norm()
-            + shapiroRangeDelayFor(vlbi.target, vlbi.stationTwoName, station_two_geometry);
+            + shapiroRangeDelayFor(vlbi.stationTwoName, station_two_geometry, targetProvider);
 
         const double truth = station_two_range - station_one_range;
         const double noise = drawNoise();

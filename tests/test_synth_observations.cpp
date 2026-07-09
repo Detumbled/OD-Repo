@@ -7,6 +7,7 @@
 #include "perturbations/Gravitational.hpp"
 #include "perturbations/SRP.hpp"
 #include "perturbations/Shapiro.hpp"
+#include "utils/CSPICE/SpiceError.hpp"
 
 #include <SpiceUsr.h>
 
@@ -21,7 +22,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -31,6 +31,7 @@
 namespace {
 
 using State6 = Eigen::Matrix<double, 6, 1>;
+using od::throwIfSpiceFailed;
 
 struct VLBIBaselineConfig {
     const char* stationOneName;
@@ -72,8 +73,6 @@ constexpr double kSaturnSystemMuKm3PerSec2 = 37940585.2;
 constexpr double kVoyagerReflectivity = 1.3;
 constexpr double kVoyagerAreaM2 = 10.0;
 constexpr double kVoyagerMassKg = 721.9;
-constexpr double kLightTimeToleranceSec = 1.0e-9;
-constexpr int kMaxLightTimeIterations = 12;
 constexpr double kRangeRateCountTimeSec = 60.0;
 constexpr double kSyntheticEphemerisLookbackSec = 3.0 * 3600.0;
 constexpr const char* kReportPath = "../synthetic_observations_dss43_voyager1.txt";
@@ -104,49 +103,21 @@ struct ReportRow {
     std::size_t sampleIndex {0};
 };
 
-struct ComputedRange {
-    double rangeKm {0.0};
-    double geometricRangeKm {0.0};
-    double shapiroDelayKm {0.0};
-    double lightTimeSec {0.0};
-    double emitEpochTdb {0.0};
+struct ComparisonStats {
+    std::size_t count {0};
+    double sumSquared {0.0};
+    double maxAbs {0.0};
+
+    void add(double delta) {
+        ++count;
+        sumSquared += delta * delta;
+        maxAbs = std::max(maxAbs, std::abs(delta));
+    }
+
+    [[nodiscard]] double rms() const {
+        return count == 0U ? 0.0 : std::sqrt(sumSquared / static_cast<double>(count));
+    }
 };
-
-class SpiceErrorModeGuard {
-public:
-    SpiceErrorModeGuard() {
-        erract_c("GET", static_cast<SpiceInt>(previous_action_.size()), previous_action_.data());
-        errprt_c("GET", static_cast<SpiceInt>(previous_report_.size()), previous_report_.data());
-        erract_c("SET", 0, const_cast<SpiceChar*>("RETURN"));
-        errprt_c("SET", 0, const_cast<SpiceChar*>("NONE"));
-    }
-
-    SpiceErrorModeGuard(const SpiceErrorModeGuard&) = delete;
-    SpiceErrorModeGuard& operator=(const SpiceErrorModeGuard&) = delete;
-
-    ~SpiceErrorModeGuard() {
-        erract_c("SET", 0, previous_action_.data());
-        errprt_c("SET", 0, previous_report_.data());
-    }
-
-private:
-    std::array<SpiceChar, 32> previous_action_ {};
-    std::array<SpiceChar, 32> previous_report_ {};
-};
-
-void throwIfSpiceFailed(const std::string& context) {
-    if (!failed_c()) {
-        return;
-    }
-
-    SpiceChar short_message[1841] = {0};
-    SpiceChar long_message[1841] = {0};
-    getmsg_c("SHORT", sizeof(short_message), short_message);
-    getmsg_c("LONG", sizeof(long_message), long_message);
-    reset_c();
-
-    throw std::runtime_error(context + ": " + short_message + " | " + long_message);
-}
 
 [[nodiscard]] State6 spiceState(const std::string& target,
                                 double tdb,
@@ -283,136 +254,6 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
     return ephemeris;
 }
 
-[[nodiscard]] State6 interpolateState(const od::EphemerisInterpolator& ephemeris,
-                                      double tdb,
-                                      const std::string& context) {
-    return asState6(ephemeris.interpolate(tdb), context);
-}
-
-[[nodiscard]] double shapiroDelayForGeometry(const Eigen::Vector3d& stationFromSun,
-                                             const Eigen::Vector3d& targetFromSun) {
-    const double geometric_range_km = (targetFromSun - stationFromSun).norm();
-    return fd::perturbations::computeShapiroRangeDelay(
-        stationFromSun.norm(),
-        targetFromSun.norm(),
-        geometric_range_km,
-        fd::perturbations::kSunGravitationalParameterKm3PerSec2);
-}
-
-[[nodiscard]] ComputedRange computeRangeAtReceiveEpoch(const od::EphemerisInterpolator& spacecraftEphemeris,
-                                                       const std::string& stationNaif,
-                                                       double receiveEpoch) {
-    const State6 station_state = spiceState(stationNaif, receiveEpoch, kCentralBody, "NONE");
-    const Eigen::Vector3d station_position = station_state.segment<3>(0);
-
-    double light_time_sec = 0.0;
-    State6 spacecraft_state = interpolateState(spacecraftEphemeris,
-                                               receiveEpoch,
-                                               "Receive-epoch synthetic ephemeris interpolation");
-
-    for (int iteration = 0; iteration < kMaxLightTimeIterations; ++iteration) {
-        const double geometric_range_km = (spacecraft_state.segment<3>(0) - station_position).norm();
-        const double updated_light_time_sec =
-            geometric_range_km / fd::perturbations::kSpeedOfLightKmPerSec;
-
-        if (std::abs(updated_light_time_sec - light_time_sec) < kLightTimeToleranceSec) {
-            light_time_sec = updated_light_time_sec;
-            break;
-        }
-
-        light_time_sec = updated_light_time_sec;
-        spacecraft_state = interpolateState(spacecraftEphemeris,
-                                            receiveEpoch - light_time_sec,
-                                            "Emit-epoch synthetic ephemeris interpolation");
-    }
-
-    const Eigen::Vector3d target_position = spacecraft_state.segment<3>(0);
-    const double geometric_range_km = (target_position - station_position).norm();
-    const double shapiro_delay_km = shapiroDelayForGeometry(station_position, target_position);
-
-    return ComputedRange{
-        geometric_range_km + shapiro_delay_km,
-        geometric_range_km,
-        shapiro_delay_km,
-        light_time_sec,
-        receiveEpoch - light_time_sec
-    };
-}
-
-[[nodiscard]] double computeVlbiDelayAtReceiveEpoch(const od::EphemerisInterpolator& spacecraftEphemeris,
-                                                    const std::string& stationOneNaif,
-                                                    const std::string& stationTwoNaif,
-                                                    double receiveEpoch) {
-    const ComputedRange station_one_range =
-        computeRangeAtReceiveEpoch(spacecraftEphemeris, stationOneNaif, receiveEpoch);
-    const ComputedRange station_two_range =
-        computeRangeAtReceiveEpoch(spacecraftEphemeris, stationTwoNaif, receiveEpoch);
-    return station_two_range.rangeKm - station_one_range.rangeKm;
-}
-
-[[nodiscard]] double computeRangeRateAtReceiveEpoch(const od::EphemerisInterpolator& spacecraftEphemeris,
-                                                    const std::string& stationNaif,
-                                                    double receiveEpoch,
-                                                    double countTimeSec) {
-    const double half_count_time = 0.5 * countTimeSec;
-    const ComputedRange start_range =
-        computeRangeAtReceiveEpoch(spacecraftEphemeris, stationNaif, receiveEpoch - half_count_time);
-    const ComputedRange end_range =
-        computeRangeAtReceiveEpoch(spacecraftEphemeris, stationNaif, receiveEpoch + half_count_time);
-    return (end_range.rangeKm - start_range.rangeKm) / countTimeSec;
-}
-
-[[nodiscard]] Eigen::Vector3d rotateJ2000ToItrf93(const Eigen::Vector3d& vector,
-                                                  double epochTdb) {
-    SpiceDouble rotation[3][3] = {};
-    pxform_c(kFrame, "ITRF93", epochTdb, rotation);
-    throwIfSpiceFailed("Failed to transform propagated line-of-sight into ITRF93");
-
-    return Eigen::Vector3d{
-        rotation[0][0] * vector.x() + rotation[0][1] * vector.y() + rotation[0][2] * vector.z(),
-        rotation[1][0] * vector.x() + rotation[1][1] * vector.y() + rotation[1][2] * vector.z(),
-        rotation[2][0] * vector.x() + rotation[2][1] * vector.y() + rotation[2][2] * vector.z()
-    };
-}
-
-[[nodiscard]] Eigen::Vector3d stationUpVectorItrf(const od::Station& station) {
-    const double cos_lat = std::cos(station.latitudeRad());
-    return Eigen::Vector3d{
-        cos_lat * std::cos(station.longitudeRad()),
-        cos_lat * std::sin(station.longitudeRad()),
-        std::sin(station.latitudeRad())
-    };
-}
-
-[[nodiscard]] double computePropagatedElevationDeg(const od::EphemerisInterpolator& spacecraftEphemeris,
-                                                   const od::Station& station,
-                                                   const std::string& stationNaif,
-                                                   double epochTdb) {
-    const State6 spacecraft_state = interpolateState(spacecraftEphemeris,
-                                                     epochTdb,
-                                                     "Elevation-mask synthetic ephemeris interpolation");
-    const State6 station_state = spiceState(stationNaif, epochTdb, kCentralBody, "NONE");
-    const Eigen::Vector3d los_j2000 =
-        spacecraft_state.segment<3>(0) - station_state.segment<3>(0);
-    const Eigen::Vector3d los_itrf = rotateJ2000ToItrf93(los_j2000, epochTdb);
-    const double range_km = los_itrf.norm();
-    if (range_km <= 0.0) {
-        throw std::runtime_error("Cannot compute elevation for zero station-spacecraft range.");
-    }
-
-    const double sin_elevation =
-        std::clamp(los_itrf.normalized().dot(stationUpVectorItrf(station)), -1.0, 1.0);
-    return std::asin(sin_elevation) * dpr_c();
-}
-
-[[nodiscard]] double drawGaussian(std::mt19937& rng, double sigma) {
-    if (sigma == 0.0) {
-        return 0.0;
-    }
-    std::normal_distribution<double> distribution(0.0, sigma);
-    return distribution(rng);
-}
-
 [[nodiscard]] double rangeRateSigmaForCountTime() {
     return kRangeRateSigmaKmPerSec / std::sqrt(kRangeRateCountTimeSec);
 }
@@ -432,50 +273,55 @@ void appendHistory(od::EphemerisInterpolator& ephemeris,
     };
 }
 
+[[nodiscard]] fd::observations::synth::NoiseConfig makeNoiseConfig(double sigma,
+                                                                   std::uint32_t seed,
+                                                                   bool enabled = true) {
+    fd::observations::synth::NoiseConfig noise;
+    noise.enabled = enabled;
+    noise.sigma = sigma;
+    noise.seed = seed;
+    return noise;
+}
+
+[[nodiscard]] const fd::observations::synth::SyntheticObservationSample& singleSample(
+    const std::vector<fd::observations::synth::SyntheticObservationSample>& samples,
+    const std::string& context) {
+    if (samples.size() != 1U) {
+        throw std::runtime_error(context + " did not generate exactly one sample.");
+    }
+    return samples.front();
+}
+
 [[nodiscard]] VLBIObservationSet generateVlbiObservationSet(
     const VLBIBaselineConfig& baseline,
-    const od::EphemerisInterpolator& truthEphemeris,
-    const std::vector<double>& epochs,
+    const fd::observations::synth::TargetStateProvider& targetProvider,
+    double startEpoch,
+    double endEpoch,
     double stationGeometryEpoch) {
     const StationInfo station_one = stationInfoForName(baseline.stationOneName, stationGeometryEpoch);
     const StationInfo station_two = stationInfoForName(baseline.stationTwoName, stationGeometryEpoch);
 
-    std::mt19937 vlbi_rng(baseline.noiseSeed);
     VLBIObservationSet vlbi_set;
     vlbi_set.stationOneName = station_one.station.name();
     vlbi_set.stationTwoName = station_two.station.name();
     vlbi_set.stationOneNaif = station_one.stationNaif;
     vlbi_set.stationTwoNaif = station_two.stationNaif;
 
-    vlbi_set.delays.reserve(epochs.size());
-    for (const double epoch : epochs) {
-        const bool first_visible =
-            computePropagatedElevationDeg(truthEphemeris,
-                                          station_one.station,
-                                          station_one.stationNaif,
-                                          epoch) >= kElevationMaskDeg;
-        const bool second_visible =
-            computePropagatedElevationDeg(truthEphemeris,
-                                          station_two.station,
-                                          station_two.stationNaif,
-                                          epoch) >= kElevationMaskDeg;
-        if (!first_visible || !second_visible) {
-            continue;
-        }
+    fd::observations::synth::VLBIConfig vlbi_config;
+    vlbi_config.target = kTarget;
+    vlbi_config.stationOneName = vlbi_set.stationOneName;
+    vlbi_config.stationTwoName = vlbi_set.stationTwoName;
+    vlbi_config.frame = kFrame;
+    vlbi_config.aberrationCorrection = "LT";
+    vlbi_config.minimumElevationRad = kElevationMaskDeg / dpr_c();
 
-        const double truth = computeVlbiDelayAtReceiveEpoch(truthEphemeris,
-                                                            vlbi_set.stationOneNaif,
-                                                            vlbi_set.stationTwoNaif,
-                                                            epoch);
-        const double noise = drawGaussian(vlbi_rng, kVLBISigmaKm);
-        vlbi_set.delays.push_back(fd::observations::synth::SyntheticObservationSample{
-            epoch,
-            truth,
-            noise,
-            truth + noise,
-            kVLBISigmaKm
-        });
-    }
+    fd::observations::synth::VLBISynth vlbi_synth(
+        vlbi_config,
+        makeNoiseConfig(kVLBISigmaKm, baseline.noiseSeed));
+    vlbi_set.delays = vlbi_synth.generate(startEpoch,
+                                          endEpoch,
+                                          kVLBICadenceSec,
+                                          targetProvider);
 
     if (vlbi_set.delays.size() < kMinVLBISamplesPerBaseline) {
         std::ostringstream message;
@@ -610,11 +456,59 @@ void writeReport(
     }
 }
 
+void addCspiceComparisonForStation(const StationObservationSet& stationSet,
+                                   ComparisonStats& rangeStats,
+                                   ComparisonStats& rangeRateStats) {
+    const fd::observations::synth::NoiseConfig no_noise = makeNoiseConfig(0.0, 0U, false);
+    fd::observations::synth::RangeSynth cspice_range_synth(stationSet.geometry, no_noise);
+    fd::observations::synth::RangeRateSynth cspice_rate_synth(stationSet.geometry, no_noise);
+
+    for (std::size_t i = 0; i < stationSet.ranges.size(); ++i) {
+        const auto& simulated_range = stationSet.ranges[i];
+        const auto& simulated_rate = stationSet.rangeRates[i];
+        const auto cspice_range =
+            cspice_range_synth.generate(simulated_range.epochTdb,
+                                        simulated_range.epochTdb,
+                                        kCadenceSec);
+        const auto cspice_rate =
+            cspice_rate_synth.generate(simulated_rate.epochTdb,
+                                       simulated_rate.epochTdb,
+                                       kCadenceSec,
+                                       kRangeRateCountTimeSec);
+
+        rangeStats.add(simulated_range.truth
+                       - singleSample(cspice_range, "CSPICE range comparison").truth);
+        rangeRateStats.add(simulated_rate.truth
+                           - singleSample(cspice_rate, "CSPICE range-rate comparison").truth);
+    }
+}
+
+void addCspiceComparisonForVlbi(const VLBIObservationSet& vlbiSet,
+                                ComparisonStats& vlbiStats) {
+    const fd::observations::synth::NoiseConfig no_noise = makeNoiseConfig(0.0, 0U, false);
+    fd::observations::synth::VLBIConfig vlbi_config;
+    vlbi_config.target = kTarget;
+    vlbi_config.stationOneName = vlbiSet.stationOneName;
+    vlbi_config.stationTwoName = vlbiSet.stationTwoName;
+    vlbi_config.frame = kFrame;
+    vlbi_config.aberrationCorrection = "LT";
+    vlbi_config.minimumElevationRad = -1.57079632679489661923;
+
+    fd::observations::synth::VLBISynth cspice_vlbi_synth(vlbi_config, no_noise);
+    for (const auto& simulated_delay : vlbiSet.delays) {
+        const auto cspice_vlbi = cspice_vlbi_synth.generate(simulated_delay.epochTdb,
+                                                            simulated_delay.epochTdb,
+                                                            kVLBICadenceSec);
+        vlbiStats.add(simulated_delay.truth
+                      - singleSample(cspice_vlbi, "CSPICE VLBI comparison").truth);
+    }
+}
+
 } // namespace
 
 int main() {
     try {
-        const SpiceErrorModeGuard spice_error_mode;
+        const od::SpiceErrorModeGuard spice_error_mode("RETURN", "NONE");
 
         furnsh_c(kMetaKernel);
         throwIfSpiceFailed("Failed to load synthetic observation meta-kernel");
@@ -696,13 +590,12 @@ int main() {
                                    truth_initial_state,
                                    ephemeris_start_et,
                                    ephemeris_end_et);
+        const fd::observations::synth::InterpolatedTargetStateProvider truth_provider(
+            truth_ephemeris,
+            "Synthetic truth ephemeris interpolation");
 
         const std::vector<double> epochs =
             fd::observations::synth::SyntheticObservation::makeEpochGrid(start_et, end_et, kCadenceSec);
-        const std::vector<double> vlbi_epochs =
-            fd::observations::synth::SyntheticObservation::makeEpochGrid(start_et,
-                                                                         end_et,
-                                                                         kVLBICadenceSec);
 
         std::vector<StationObservationSet> station_sets;
         station_sets.reserve(kStationNames.size());
@@ -717,8 +610,14 @@ int main() {
             geometry.frame = "J2000";
             geometry.aberrationCorrection = "LT";
 
-            std::mt19937 range_rng(4301U + static_cast<std::uint32_t>(100U * station_index));
-            std::mt19937 range_rate_rng(4302U + static_cast<std::uint32_t>(100U * station_index));
+            fd::observations::synth::RangeSynth range_synth(
+                geometry,
+                makeNoiseConfig(kRangeSigmaKm,
+                                4301U + static_cast<std::uint32_t>(100U * station_index)));
+            fd::observations::synth::RangeRateSynth range_rate_synth(
+                geometry,
+                makeNoiseConfig(kRangeRateSigmaKmPerSec,
+                                4302U + static_cast<std::uint32_t>(100U * station_index)));
 
             std::vector<fd::observations::synth::SyntheticObservationSample> valid_ranges;
             std::vector<fd::observations::synth::SyntheticObservationSample> valid_rates;
@@ -726,37 +625,23 @@ int main() {
             valid_rates.reserve(epochs.size());
 
             for (const double epoch : epochs) {
-                if (computePropagatedElevationDeg(truth_ephemeris,
-                                                  station_info.station,
-                                                  station_info.stationNaif,
-                                                  epoch) >= kElevationMaskDeg) {
-                    const ComputedRange range =
-                        computeRangeAtReceiveEpoch(truth_ephemeris, station_info.stationNaif, epoch);
-                    const double range_rate_truth =
-                        computeRangeRateAtReceiveEpoch(truth_ephemeris,
-                                                       station_info.stationNaif,
-                                                       epoch,
-                                                       kRangeRateCountTimeSec);
-                    const double range_rate_sigma = rangeRateSigmaForCountTime();
-
-                    const double range_noise = drawGaussian(range_rng, kRangeSigmaKm);
-                    const double range_rate_noise =
-                        drawGaussian(range_rate_rng, range_rate_sigma);
-
-                    valid_ranges.push_back(fd::observations::synth::SyntheticObservationSample{
-                        epoch,
-                        range.rangeKm,
-                        range_noise,
-                        range.rangeKm + range_noise,
-                        kRangeSigmaKm
-                    });
-                    valid_rates.push_back(fd::observations::synth::SyntheticObservationSample{
-                        epoch,
-                        range_rate_truth,
-                        range_rate_noise,
-                        range_rate_truth + range_rate_noise,
-                        range_rate_sigma
-                    });
+                if (range_synth.isVisibleAboveElevation(epoch,
+                                                        station_info.station,
+                                                        kElevationMaskDeg / dpr_c(),
+                                                        truth_provider)) {
+                    const auto range_sample = range_synth.generate(epoch,
+                                                                   epoch,
+                                                                   kCadenceSec,
+                                                                   truth_provider);
+                    const auto rate_sample = range_rate_synth.generate(epoch,
+                                                                       epoch,
+                                                                       kCadenceSec,
+                                                                       kRangeRateCountTimeSec,
+                                                                       truth_provider);
+                    valid_ranges.push_back(singleSample(range_sample,
+                                                        "Simulated range generation"));
+                    valid_rates.push_back(singleSample(rate_sample,
+                                                       "Simulated range-rate generation"));
                 }
             }
 
@@ -777,8 +662,9 @@ int main() {
         vlbi_sets.reserve(kVLBIBaselines.size());
         for (const VLBIBaselineConfig& baseline : kVLBIBaselines) {
             vlbi_sets.push_back(generateVlbiObservationSet(baseline,
-                                                           truth_ephemeris,
-                                                           vlbi_epochs,
+                                                           truth_provider,
+                                                           start_et,
+                                                           end_et,
                                                            start_et));
         }
 
@@ -793,30 +679,27 @@ int main() {
         const ReportRow& first_row = report_rows.front();
         const StationObservationSet& first_station_set = *first_row.stationSet;
         const double first_epoch = first_station_set.ranges[first_row.sampleIndex].epochTdb;
-        const double first_vlbi_epoch = vlbi_sets.front().delays.front().epochTdb;
 
-        fd::observations::synth::NoiseConfig no_noise;
-        no_noise.enabled = false;
-        no_noise.sigma = 0.0;
+        ComparisonStats range_comparison;
+        ComparisonStats range_rate_comparison;
+        ComparisonStats vlbi_comparison;
+        for (const StationObservationSet& station_set : station_sets) {
+            addCspiceComparisonForStation(station_set,
+                                          range_comparison,
+                                          range_rate_comparison);
+        }
+        for (const VLBIObservationSet& vlbi_set : vlbi_sets) {
+            addCspiceComparisonForVlbi(vlbi_set, vlbi_comparison);
+        }
+
+        const fd::observations::synth::NoiseConfig no_noise = makeNoiseConfig(0.0, 0U, false);
         fd::observations::synth::RangeSynth cspice_range_synth(first_station_set.geometry, no_noise);
         fd::observations::synth::RangeRateSynth cspice_rate_synth(first_station_set.geometry, no_noise);
-        fd::observations::synth::VLBIConfig vlbi_config;
-        vlbi_config.target = kTarget;
-        vlbi_config.stationOneName = vlbi_sets.front().stationOneName;
-        vlbi_config.stationTwoName = vlbi_sets.front().stationTwoName;
-        vlbi_config.frame = kFrame;
-        vlbi_config.aberrationCorrection = "LT";
-        vlbi_config.minimumElevationRad = kElevationMaskDeg / dpr_c();
-        fd::observations::synth::VLBISynth cspice_vlbi_synth(vlbi_config, no_noise);
         const auto cspice_range = cspice_range_synth.generate(first_epoch, first_epoch, kCadenceSec);
         const auto cspice_rate =
             cspice_rate_synth.generate(first_epoch, first_epoch, kCadenceSec, kRangeRateCountTimeSec);
-        const auto cspice_vlbi = cspice_vlbi_synth.generate(first_vlbi_epoch,
-                                                            first_vlbi_epoch,
-                                                            kVLBICadenceSec);
-        if (cspice_range.size() != 1U || cspice_rate.size() != 1U || cspice_vlbi.size() != 1U) {
-            throw std::runtime_error("Failed to generate one-sample CSPICE comparison observation.");
-        }
+        const auto& first_cspice_range = singleSample(cspice_range, "First CSPICE range comparison");
+        const auto& first_cspice_rate = singleSample(cspice_rate, "First CSPICE range-rate comparison");
 
         std::cout << "Generated " << total_observation_count
                   << " visible DSS-43/DSS-63 Voyager 1 station observations in " << kReportPath << '\n'
@@ -839,22 +722,32 @@ int main() {
                   << "First observation CSPICE/RKF45 LT comparison\n"
                   << "  station                      : " << first_station_set.station.name() << '\n'
                   << "  utc                          : " << utcFromEt(first_epoch) << '\n'
-                  << "  cspice range truth km        : " << cspice_range.front().truth << '\n'
+                  << "  cspice range truth km        : " << first_cspice_range.truth << '\n'
                   << "  rkf45 range truth km         : "
                   << first_station_set.ranges[first_row.sampleIndex].truth << '\n'
                   << "  range delta m                : "
-                  << (first_station_set.ranges[first_row.sampleIndex].truth - cspice_range.front().truth)
+                  << (first_station_set.ranges[first_row.sampleIndex].truth
+                      - first_cspice_range.truth)
                       * 1000.0 << '\n'
-                  << "  cspice range-rate truth km/s : " << cspice_rate.front().truth << '\n'
+                  << "  cspice range-rate truth km/s : " << first_cspice_rate.truth << '\n'
                   << "  rkf45 range-rate truth km/s  : "
                   << first_station_set.rangeRates[first_row.sampleIndex].truth << '\n'
                   << "  range-rate delta mm/s        : "
-                  << (first_station_set.rangeRates[first_row.sampleIndex].truth - cspice_rate.front().truth)
+                  << (first_station_set.rangeRates[first_row.sampleIndex].truth
+                      - first_cspice_rate.truth)
                       * 1.0e6 << '\n'
-                  << "  cspice VLBI truth km         : " << cspice_vlbi.front().truth << '\n'
-                  << "  rkf45 VLBI truth km          : " << vlbi_sets.front().delays.front().truth << '\n'
-                  << "  VLBI delta m                 : "
-                  << (vlbi_sets.front().delays.front().truth - cspice_vlbi.front().truth) * 1000.0 << '\n'
+                  << "Aggregate CSPICE/RKF45 source comparison\n"
+                  << "  range samples                : " << range_comparison.count << '\n'
+                  << "  range RMS delta m            : " << range_comparison.rms() * 1000.0 << '\n'
+                  << "  range max abs delta m        : " << range_comparison.maxAbs * 1000.0 << '\n'
+                  << "  range-rate samples           : " << range_rate_comparison.count << '\n'
+                  << "  range-rate RMS delta mm/s    : "
+                  << range_rate_comparison.rms() * 1.0e6 << '\n'
+                  << "  range-rate max abs delta mm/s: "
+                  << range_rate_comparison.maxAbs * 1.0e6 << '\n'
+                  << "  VLBI samples                 : " << vlbi_comparison.count << '\n'
+                  << "  VLBI RMS delta m             : " << vlbi_comparison.rms() * 1000.0 << '\n'
+                  << "  VLBI max abs delta m         : " << vlbi_comparison.maxAbs * 1000.0 << '\n'
                   << "  truth ephemeris nodes        : " << truth_ephemeris.history().size() << '\n';
 
         kclear_c();

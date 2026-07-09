@@ -17,6 +17,11 @@ public:
                                                                    double endTdb,
                                                                    double stepSeconds,
                                                                    double countTimeSeconds);
+    [[nodiscard]] std::vector<SyntheticObservationSample> generate(double startTdb,
+                                                                   double endTdb,
+                                                                   double stepSeconds,
+                                                                   double countTimeSeconds,
+                                                                   const TargetStateProvider& targetProvider);
 };
 
 } // namespace fd::observations::synth

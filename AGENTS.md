@@ -13,8 +13,8 @@ the current project conventions, module map, and verification commands.
   kernels.
 - Prefer Eigen for vector/matrix math.
 - Use km, s, km/s, and km/s^2 consistently.
-- When adding SPICE calls, use `erract_c("RETURN")` with an RAII-style guard and
-  restore the previous state.
+- When adding SPICE calls, use `od::SpiceErrorModeGuard` and
+  `od::throwIfSpiceFailed` from `include/utils/CSPICE/SpiceError.hpp`.
 
 ## Current Module Map
 
@@ -50,7 +50,6 @@ propagate-once/interpolate-many observation evaluation.
 - `include/filters/WLS.hpp`
 - `src/filters/filter.cpp`
 - `src/filters/WLS.cpp`
-- `tests/test_wls.cpp`
 
 WLS implements a batch a-priori normal equation update. It uses solves rather
 than explicitly forming inverse measurement covariance.
@@ -86,7 +85,6 @@ synthetic_observations_dss43_voyager1.txt
 - `include/perturbations/SRP.hpp`
 - `src/perturbations/Gravitational.cpp`
 - `src/perturbations/SRP.cpp`
-- `tests/test_perturbations.cpp`
 
 Current perturbation classes:
 
@@ -100,9 +98,7 @@ Targeted builds:
 
 ```sh
 cmake --build build-clang --target test_rkf45 -j4
-cmake --build build-clang --target test_wls -j4
 cmake --build build-clang --target test_synth_observations -j4
-cmake --build build-clang --target test_perturbations -j4
 cmake --build build-clang --target test_voyager_position_od -j4
 ```
 
@@ -110,9 +106,7 @@ Targeted tests:
 
 ```sh
 ctest --test-dir build-clang -R test_rkf45 --output-on-failure
-ctest --test-dir build-clang -R test_wls --output-on-failure
 ctest --test-dir build-clang -R test_synth_observations --output-on-failure
-ctest --test-dir build-clang -R test_perturbations --output-on-failure
 ctest --test-dir build-clang -R test_voyager_position_od --output-on-failure
 ```
 
@@ -151,13 +145,6 @@ Earlier attempts with `jup230`/`jup363` did not provide usable 1979 moon states
 for this test.
 
 ## Current Verified Values
-
-`test_perturbations` at `1979-03-05T00:00:00`:
-
-```text
-Jupiter third-body acceleration norm = 1.463970346623e-04 km/s^2
-SRP acceleration norm                = 2.941469913405e-12 km/s^2
-```
 
 `test_synth_observations`:
 

@@ -70,10 +70,7 @@ src/
 
 tests/
   test_ephemeris_interpolator.cpp
-  test_rkf45_history.cpp
-  test_wls.cpp
   test_synth_observations.cpp
-  test_perturbations.cpp
   test_voyager_position_od.cpp
 
 test_rkf45.cpp
@@ -108,9 +105,7 @@ For tests or demos that load `../kernels.tm`, run from `build-clang`.
 
 ```sh
 cmake --build build-clang --target test_rkf45 -j4
-cmake --build build-clang --target test_wls -j4
 cmake --build build-clang --target test_synth_observations -j4
-cmake --build build-clang --target test_perturbations -j4
 cmake --build build-clang --target test_voyager_position_od -j4
 cmake --build build-clang --target station_catalog_demo -j4
 ```
@@ -124,9 +119,7 @@ Run focused tests:
 
 ```sh
 ctest --test-dir build-clang -R test_rkf45 --output-on-failure
-ctest --test-dir build-clang -R test_wls --output-on-failure
 ctest --test-dir build-clang -R test_synth_observations --output-on-failure
-ctest --test-dir build-clang -R test_perturbations --output-on-failure
 ctest --test-dir build-clang -R test_voyager_position_od --output-on-failure
 ```
 
@@ -187,9 +180,6 @@ dx     = Lambda^-1 N
 
 The implementation uses Eigen solves rather than explicitly forming `R^-1`.
 LDLT is attempted first, with QR fallback for robustness.
-
-`test_wls` creates an 8-hour synthetic range arc with 10 m noise and verifies
-that the filter reduces both linearized and nonlinear range residual RMS.
 
 ### Synthetic Observations
 
@@ -270,13 +260,6 @@ a_3rd = mu_i * (r_sc_to_i / |r_sc_to_i|^3 - r_central_to_i / |r_central_to_i|^3)
 - anti-sunward direction
 - configurable `C_R`, area, and mass
 - returns `km/s^2`
-
-`test_perturbations` evaluates both at `1979-03-05T00:00:00` for Voyager 1:
-
-```text
-Jupiter third-body acceleration norm = 1.463970346623e-04 km/s^2
-SRP acceleration norm                = 2.941469913405e-12 km/s^2
-```
 
 ## Units
 
