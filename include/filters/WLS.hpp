@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 
@@ -71,6 +72,8 @@ public:
 
     [[nodiscard]] Eigen::VectorXd solve() const;
     [[nodiscard]] Eigen::VectorXd solveAndUpdate();
+    // Call after the owning batch driver has reported convergence.
+    void writePosteriorCovarianceCsv(const std::filesystem::path& path) const;
     [[nodiscard]] std::size_t accumulatedMeasurementCount() const noexcept;
     [[nodiscard]] const Eigen::MatrixXd& informationMatrix() const noexcept;
     [[nodiscard]] const Eigen::VectorXd& informationVector() const noexcept;

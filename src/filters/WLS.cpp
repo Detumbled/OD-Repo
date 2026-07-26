@@ -6,6 +6,10 @@
 #include <SpiceUsr.h>
 
 #include <cmath>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <locale>
 #include <stdexcept>
 #include <utility>
 
@@ -163,6 +167,39 @@ Eigen::VectorXd WLS::solveAndUpdate() {
     P_ = invertSymmetricPositiveDefinite(information_matrix_, "WLS normal information matrix");
     last_postfit_residuals_.resize(0);
     return correction;
+}
+
+void WLS::writePosteriorCovarianceCsv(const std::filesystem::path& path) const {
+    if (!initialized_) {
+        throw std::logic_error("WLS filter must be initialized before exporting posterior covariance.");
+    }
+    if (path.empty()) {
+        throw std::invalid_argument("WLS posterior covariance CSV path cannot be empty.");
+    }
+    if (P_.rows() != x_hat_.size() || P_.cols() != x_hat_.size() || !P_.allFinite()) {
+        throw std::logic_error("WLS posterior covariance is unavailable or contains non-finite values.");
+    }
+
+    std::ofstream csv(path);
+    if (!csv) {
+        throw std::runtime_error("Failed to open posterior covariance CSV: " + path.string());
+    }
+
+    csv.imbue(std::locale::classic());
+    csv << std::scientific << std::setprecision(std::numeric_limits<double>::max_digits10);
+    for (Eigen::Index row = 0; row < P_.rows(); ++row) {
+        for (Eigen::Index column = 0; column < P_.cols(); ++column) {
+            if (column != 0) {
+                csv << ',';
+            }
+            csv << P_(row, column);
+        }
+        csv << '\n';
+    }
+
+    if (!csv) {
+        throw std::runtime_error("Failed while writing posterior covariance CSV: " + path.string());
+    }
 }
 
 std::size_t WLS::accumulatedMeasurementCount() const noexcept {

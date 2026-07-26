@@ -73,6 +73,7 @@ constexpr const char* kTrajectoryErrorCsvPath = "../tests/voyager_od_trajectory_
 constexpr const char* kObservabilityWindowsCsvPath = "../tests/voyager_station_observability_windows_VLBI.csv";
 constexpr const char* kIterationResidualsCsvPath = "../tests/voyager_wls_iteration_residuals_VLBI.csv";
 constexpr const char* kIterationSummaryCsvPath = "../tests/voyager_wls_iteration_summary_VLBI.csv";
+constexpr const char* kPosteriorCovarianceCsvPath = "../tests/posterior_covariance.csv";
 
 struct Observation {
     std::string utc;
@@ -1662,6 +1663,16 @@ int main() {
                                      observations,
                                      referenceEpoch);
 
+        if (!filter.covariance().allFinite()) {
+            std::cerr << "FAIL: posterior covariance contains non-finite values.\n";
+            return EXIT_FAILURE;
+        }
+        if (!solverResult.converged()) {
+            std::cerr << "FAIL: batch least-squares driver did not converge.\n";
+            return EXIT_FAILURE;
+        }
+        filter.writePosteriorCovarianceCsv(kPosteriorCovarianceCsvPath);
+
         const double elapsedSeconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - scriptStart).count();
 
@@ -1680,6 +1691,7 @@ int main() {
                   << "  WLS iteration summary CSV     : " << kIterationSummaryCsvPath << '\n'
                   << "  trajectory error CSV          : " << kTrajectoryErrorCsvPath << '\n'
                   << "  observability windows CSV     : " << kObservabilityWindowsCsvPath << '\n'
+                  << "  posterior covariance CSV      : " << kPosteriorCovarianceCsvPath << '\n'
                   << "  active third bodies           : ";
         for (const std::string& body : activeThirdBodies) {
             std::cout << body << ' ';
@@ -1708,14 +1720,6 @@ int main() {
                       << solverResult.iterationCount() << '\n';
 	        }
 
-	        if (!filter.covariance().allFinite()) {
-	            std::cerr << "FAIL: posterior covariance contains non-finite values.\n";
-	            return EXIT_FAILURE;
-	        }
-	        if (!solverResult.converged()) {
-	            std::cerr << "FAIL: batch least-squares driver did not converge.\n";
-	            return EXIT_FAILURE;
-	        }
         if (postfitStats.weightedRms >= prefitStats.weightedRms) {
             std::cerr << "FAIL: weighted residual RMS did not decrease.\n";
             return EXIT_FAILURE;
