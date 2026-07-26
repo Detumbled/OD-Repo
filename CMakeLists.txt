@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(coding_v1 LANGUAGES C CXX) 
+project(DeepNAV LANGUAGES C CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 enable_testing()

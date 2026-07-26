@@ -25,6 +25,8 @@ Planned or partial areas:
 - Sequential filters and richer OD diagnostics.
 - Attitude/AOCS and visualization work.
 
+**Ongoing Enhancements:** Extending the framework into a general-purpose mission analysis platform incorporating **nonlinear optimization** (CppAD, IFOPT, IPOPT) for trajectory/maneuver design and multi-agent spaceborne/ground antenna tracking.
+
 ## Repository Layout
 
 ```text
