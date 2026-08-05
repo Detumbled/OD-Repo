@@ -1,6 +1,7 @@
-# OD-Repo
+# DeepNAV
 
-Orbit-determination and flight-dynamics sandbox for DSN/Voyager tracking work.
+DeepNAV is an orbit-determination and flight-dynamics sandbox for DSN/Voyager
+tracking work.
 The current implementation is centered on C++/Eigen numerical utilities,
 CSPICE-backed station geometry, synthetic observations, perturbation models, and
 batch weighted least-squares filtering.
@@ -10,61 +11,80 @@ batch weighted least-squares filtering.
 Implemented modules:
 
 - CSPICE-backed DSN station catalog.
-- Adaptive RKF45 integrator using Eigen vectors and preallocated stage storage.
-- Batch Weighted Least Squares filter with a priori information.
+- Adaptive RKF45 and DP853 numerical integration with reusable ephemeris
+  interpolation.
+- Batch Weighted Least Squares filtering with a priori information and an
+  iterative convergence driver.
 - Synthetic one-way range, range-rate, and VLBI differential range observations.
+- Interchangeable propagated-ephemeris and direct-CSPICE target-state sources.
 - Solar Shapiro delay applied to synthetic radiometric observables.
 - Modular perturbation models for third-body gravity and cannonball SRP.
-- Focused tests for RKF45, WLS, synthetic observations, perturbations,
-  station-kernel sanity checks, and a Voyager 1 position OD smoke case.
+- Focused tests for numerical integration, ephemeris interpolation, synthetic
+  observations, station-kernel sanity checks, and a Voyager 1 position OD case
+  that exercises WLS and the perturbation models.
 
 Planned or partial areas:
 
-- Computed-observation light-time iteration integrated with the estimator.
+- Promotion of the estimator's computed-observation and dynamics code from the
+  Voyager test into reusable library modules.
 - Full dynamics builder that sums central gravity, third bodies, SRP, and future force models.
 - Sequential filters and richer OD diagnostics.
 - Attitude/AOCS and visualization work.
 
-**Ongoing Enhancements:** Extending the framework into a general-purpose mission analysis platform incorporating **nonlinear optimization** (CppAD, IFOPT, IPOPT) for trajectory/maneuver design and multi-agent spaceborne/ground antenna tracking.
+Longer-term directions include nonlinear optimization for trajectory and
+maneuver design, plus multi-agent spaceborne/ground antenna tracking. CppAD,
+IFOPT, and IPOPT are not yet wired into the current CMake build.
 
 ## Repository Layout
 
+The active library and test modules wired into CMake are:
+
 ```text
 include/
+  DP853Integrator.hpp
   RKF45Integrator.hpp
   dynamics/
     EphemerisInterpolator.hpp
+    SpiceInterpolator.hpp
   stations/
     ElevationMask.hpp
     StationCatalog.hpp
     Stations.hpp
   filters/
+    BatchLeastSquaresDriver.hpp
     filter.hpp
     WLS.hpp
   observations/synth/
     obs_synth.hpp
     RangeSynth.hpp
     RangeRateSynth.hpp
+    TargetStateProvider.hpp
     VLBISynth.hpp
   perturbations/
     Gravitational.hpp
     SRP.hpp
     Shapiro.hpp
+  utils/CSPICE/
+    SpiceError.hpp
+    SpiceErrorModeGuard.hpp
 
 src/
   RKF45Integrator.cpp
   dynamics/
     EphemerisInterpolator.cpp
+    SpiceInterpolator.cpp
   stations/
     ElevationMask.cpp
     StationCatalog.cpp
   filters/
+    BatchLeastSquaresDriver.cpp
     filter.cpp
     WLS.cpp
   observations/synth/
     obs_synth.cpp
     RangeSynth.cpp
     RangeRateSynth.cpp
+    TargetStateProvider.cpp
     VLBISynth.cpp
   perturbations/
     Gravitational.cpp
@@ -73,6 +93,7 @@ src/
 tests/
   test_ephemeris_interpolator.cpp
   test_synth_observations.cpp
+  test_synth_source_comparison.cpp
   test_voyager_position_od.cpp
 
 test_rkf45.cpp
@@ -83,12 +104,15 @@ kernels.tm
 
 ## Dependencies
 
-The CMake project currently uses C++23 and links these dependencies:
+The CMake project is named `DeepNAV`, uses C++23, and links these dependencies:
 
 - Eigen3
 - CSPICE
 - GLFW, GLEW, OpenGL
 - local `third_party/imgui`, `third_party/implot`, and `third_party/glm`
+
+The optional diagnostic scripts under `tests/` use Python 3, NumPy, Matplotlib,
+and, for `plot_observability.py`, pandas.
 
 `CSPICE_HOME` must point to the CSPICE installation:
 
@@ -97,17 +121,33 @@ export CSPICE_HOME=/path/to/cspice
 ```
 
 The project expects the Voyager/DSN kernels under `Kernels/` and the meta-kernel
-at `kernels.tm`. The Voyager Jupiter-encounter OD test requires `jup310.bsp`
-for 1979 coverage of Jupiter body `599` and Galilean moons `501-504`.
+at `kernels.tm`. The Voyager Jupiter-encounter source-comparison and OD tests
+require `jup310.bsp` for 1979 coverage of Jupiter body `599` and Galilean moons
+`501-504`.
 
 Important path convention: `kernels.tm` uses `PATH_VALUES = ( '../Kernels' )`.
 For tests or demos that load `../kernels.tm`, run from `build-clang`.
 
 ## Build
 
+On Apple Silicon with the expected Homebrew paths, the included preset creates
+the conventional `build-clang` directory:
+
+```sh
+cmake --preset homebrew-clang
+```
+
+For other toolchains, configure the same directory directly:
+
+```sh
+cmake -S . -B build-clang -DCMAKE_BUILD_TYPE=Release
+```
+
 ```sh
 cmake --build build-clang --target test_rkf45 -j4
+cmake --build build-clang --target test_ephemeris_interpolator -j4
 cmake --build build-clang --target test_synth_observations -j4
+cmake --build build-clang --target test_synth_source_comparison -j4
 cmake --build build-clang --target test_voyager_position_od -j4
 cmake --build build-clang --target station_catalog_demo -j4
 ```
@@ -121,12 +161,18 @@ Run focused tests:
 
 ```sh
 ctest --test-dir build-clang -R test_rkf45 --output-on-failure
+ctest --test-dir build-clang -R test_ephemeris_interpolator --output-on-failure
 ctest --test-dir build-clang -R test_synth_observations --output-on-failure
+ctest --test-dir build-clang -R test_synth_source_comparison --output-on-failure
 ctest --test-dir build-clang -R test_voyager_position_od --output-on-failure
 ```
 
 SPICE-backed tests are registered with `build-clang` as their working directory
 so `../kernels.tm` resolves correctly.
+
+Run `test_synth_observations` before `test_voyager_position_od` when the
+synthetic report needs to be generated or refreshed; the OD test consumes that
+report.
 
 `test_stations.cpp` is an older kernel smoke test and currently hard-codes
 `../Kernels.tm`. On case-sensitive filesystems, either update that literal to
@@ -152,7 +198,7 @@ compute station-target elevation from CSPICE ITRF93 geometry. The current kernel
 set does not include station topo-frame definitions such as `DSS-43_TOPO`, so
 the helper derives the local up vector from station geodetic coordinates.
 
-### RKF45 Integrator
+### Numerical Integration and Ephemeris Interpolation
 
 `RKF45Integrator` uses:
 
@@ -166,8 +212,17 @@ the helper derives the local up vector from station geodetic coordinates.
 `od::EphemerisInterpolator` stores RKF45 state and derivative nodes and evaluates
 cubic Hermite states with logarithmic interval lookup.
 
+`od::DP853Integrator` is a header-only adaptive eighth-order integrator for
+six-element states. It can retain accepted-step history in the same node format
+used by `od::EphemerisInterpolator` and is used by the Voyager OD test.
+
+`od::SpiceInterpolator` samples CSPICE states over a configured interval and
+uses cubic Hermite interpolation for repeated body and station state queries.
+
 `test_rkf45` propagates a simple circular Kepler orbit for one period and checks
 position closure, velocity closure, energy, angular momentum, and runtime.
+`test_ephemeris_interpolator` covers interpolation nodes, interior values, and
+out-of-range error handling.
 
 ### WLS Filter
 
@@ -183,6 +238,10 @@ dx     = Lambda^-1 N
 The implementation uses Eigen solves rather than explicitly forming `R^-1`.
 LDLT is attempted first, with QR fallback for robustness.
 
+`fd::filters::BatchLeastSquaresDriver` repeatedly linearizes and applies WLS
+updates. It supports iteration callbacks and convergence checks based on
+weighted RMS and whole-state, component, or state-block correction tolerances.
+
 ### Synthetic Observations
 
 Synthetic observation classes live under `fd::observations::synth`.
@@ -193,6 +252,8 @@ Shared features:
 - `NoiseConfig`: enabled flag, sigma, random seed.
 - Configurable time grid via `makeEpochGrid(start, end, step)`.
 - CSPICE station names resolved through the DSN station catalog.
+- A `TargetStateProvider` interface supporting either propagated/interpolated
+  target states or direct geometric states from CSPICE.
 
 `RangeSynth`:
 
@@ -243,6 +304,11 @@ column:
 ```text
 synthetic_observations_dss43_voyager1.txt
 ```
+
+`test_synth_source_comparison` evaluates range, range-rate, and VLBI with a
+propagated target-state provider and reports differences from the direct
+CSPICE source. This is a diagnostic comparison: it verifies that every
+comparison set is populated but does not impose accuracy thresholds.
 
 ### Perturbations
 
@@ -309,14 +375,28 @@ tests/voyager_position_estimation_report.txt
 tests/voyager_od_postfit_diagnostics_VLBI.csv
 tests/voyager_od_trajectory_error_VLBI.csv
 tests/voyager_station_observability_windows_VLBI.csv
+tests/voyager_wls_iteration_residuals_VLBI.csv
+tests/voyager_wls_iteration_summary_VLBI.csv
+tests/posterior_covariance.csv
 ```
 
 The CSV exports are intended for Python plotting. The post-fit diagnostics CSV
 contains final residuals and state errors at observation epochs. The trajectory
 CSV contains truth-estimate state error at the arc cadence. The observability
 CSV contains contiguous station visibility windows from the elevation-masked
-observation schedule. Historical non-VLBI CSVs without the `_VLBI` suffix may be
-kept for comparison plots.
+observation schedule. The WLS CSVs contain residuals and state-error summaries
+for each solver iteration, while `posterior_covariance.csv` stores the final
+6-by-6 state covariance. Historical non-VLBI CSVs without the `_VLBI` suffix
+may be kept for comparison plots.
+
+Run the companion diagnostics from the repository root after generating the
+CSVs:
+
+```sh
+python3 tests/plot_wls_iteration_residuals.py
+python3 tests/analyze_posterior_covariance.py
+python3 tests/plot_vlbi_comparison.py
+```
 
 Latest verified `jup310.bsp` run:
 
